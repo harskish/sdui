@@ -3,7 +3,7 @@ import imgui
 import torch
 import argparse
 import numpy as np
-import textwrap
+from textwrap import dedent
 from sys import exit
 from multiprocessing import Lock
 from dataclasses import dataclass
@@ -18,6 +18,11 @@ from glfw import KEY_LEFT_SHIFT
 from tqdm import trange
 from pytorch_lightning import seed_everything
 import gdown
+import glfw
+from functools import partial
+from PIL.PngImagePlugin import PngInfo, PngImageFile
+import json
+from PIL import Image
 
 from omegaconf import OmegaConf
 from torch import autocast
@@ -40,6 +45,24 @@ if mps and mps.is_available() and mps.is_built():
     device = 'mps'
     _orig = torch.Tensor.__repr__
     torch.Tensor.__repr__ = lambda t: _orig(t.cpu()) # nightlies still slightly buggy...
+
+def file_drop_callback(window, paths, viewer):
+    for p in paths:
+        suff = Path(p).suffix.lower()
+        if suff == '.png':
+            meta = get_meta_from_img(p)
+            viewer.from_dict(meta)
+
+def get_meta_from_img(path: str):
+    state_dump = r'{}'
+    
+    if path.endswith('.png'):
+        test = PngImageFile(path)
+        state_dump = test.text['description']
+    else:
+        print(f'Unknown extension {Path(path).suffix}')
+
+    return json.loads(state_dump)
 
 def sample_seeds(N, base=None):
     if base is None:
@@ -66,7 +89,7 @@ def download_weights():
 
     resp = None
     while resp not in ['yes', 'y', 'no', 'n']:
-        resp = input(textwrap.dedent(
+        resp = input(dedent(
         '''
         The model weights are licensed under the CreativeML OpenRAIL License.
         Please read the full license here: https://huggingface.co/spaces/CompVis/stable-diffusion-license
@@ -79,7 +102,6 @@ def download_weights():
     makedirs(trg.parent, exist_ok=True)
     gdown.download(id='1F8R6C_63mM49vjYRoaAgMTtHRrwX3YhZ', output=str(trg), quiet=False)
     assert trg.is_file(), 'DL failed!'
-        
 
 def load_model_from_config(config, ckpt, verbose=False):
     print(f"Loading model from {ckpt}")
@@ -105,6 +127,10 @@ class ModelViz(ToolbarViewer):
     def __init__(self, name, batch_mode=False, hidden=False):
         self.batch_mode = batch_mode
         super().__init__(name, batch_mode=batch_mode, hidden=hidden)
+
+    def setup_callbacks(self, window):
+        glfw.set_drop_callback(window,
+            partial(file_drop_callback, viewer=self))
     
     # Check for missing type annotations (break by-value comparisons)
     def check_dataclass(self, obj):
@@ -121,7 +147,6 @@ class ModelViz(ToolbarViewer):
         
         self.check_dataclass(self.state)
         self.check_dataclass(self.rend)
-        self.G_lock = Lock()
     
     @lru_cache()
     def _get_model(self, pkl):
@@ -149,6 +174,42 @@ class ModelViz(ToolbarViewer):
 
         return model
 
+    @property
+    def to_dict(self):
+        from dataclasses import asdict
+        return {
+            'state': asdict(self.state),
+        }
+
+    def from_dict(self, state_dict):
+        state_dict = state_dict['state']
+        
+        # Ignore certain values
+        ignores = []
+        state_dict = { k: v for k,v in state_dict.items() if k not in ignores }
+    
+        for k, v in state_dict.items():
+            setattr(self.state, k, v)
+
+        self.prompt_curr = self.state.prompt
+
+    def export_img(self):
+        grid = reshape_grid(self.rend.intermed) # HWC
+        im = Image.fromarray(np.uint8(255*grid.clip(0,1).cpu().numpy()))
+        metadata = json.dumps(self.to_dict, sort_keys=True)
+        
+        from datetime import datetime
+        fname = datetime.now().strftime(r'%d%m%Y_%H%M%S.png')
+        outdir = Path('./outputs')
+        os.makedirs(outdir, exist_ok=True)
+
+        chunk = PngInfo()
+        chunk.add_text('description', metadata)
+        opt = np.prod(grid.shape[:2]) < 2_000_000
+        im.save(outdir / fname, format='png', optimize=opt, compress_level=9, pnginfo=chunk) # max compression
+        
+        print('Saved as', fname)
+
     # Progress bar below images
     def draw_output_extra(self):
         self.rend.i = imgui.slider_int('', self.rend.i + 1, 1, self.rend.last_ui_state.T)[1] - 1
@@ -175,9 +236,6 @@ class ModelViz(ToolbarViewer):
             return None
 
         model = self.rend.model
-
-        ###############################
-        # TEST: STABLEDIFF
 
         # Read from or write to cache
         finished = [False]*s.B
@@ -214,7 +272,7 @@ class ModelViz(ToolbarViewer):
                 if self.rend.c is None:
                     if s.guidance_scale != 1.0:
                         self.rend.uc = model.get_learned_conditioning(s.B * [""])
-                    self.rend.c = model.get_learned_conditioning(s.B * [s.prompt])
+                    self.rend.c = model.get_learned_conditioning(s.B * [s.prompt.replace('\n', ' ')])
 
                 def cbk_img(img_curr, i):
                     x_samples_ddim = model.decode_first_stage(img_curr)
@@ -238,19 +296,6 @@ class ModelViz(ToolbarViewer):
                 x_samples_ddim = torch.clamp((x_samples_ddim + 1.0) / 2.0, min=0.0, max=1.0) # [1, 3, 512, 512]
 
                 self.rend.intermed = x_samples_ddim
-
-
-        ################################
-
-
-
-        # Run diffusion one step forward
-        # T = torch.tensor([s.T] * s.B, device=model.dev_img).view(-1, 1)
-        # t = T - self.rend.i - 1 # 0-based index, num_steps -> 0
-        # if model.img_fused:
-        #     self.rend.intermed = model.sample_img_incr_fused(T, t, self.rend.intermed, cond)
-        # else:
-        #     self.rend.intermed = model.sample_img_incr(t, self.rend.intermed, cond, *self.rend.img_samp_params)
         
         # Move on to next iteration
         #self.rend.i += 1
@@ -279,7 +324,10 @@ class ModelViz(ToolbarViewer):
         s.T = imgui.input_int('T_img', s.T, 1, jmp_large)[1]
         self.prompt_curr = imgui.input_text_multiline('Prompt', self.prompt_curr, buffer_length=2048)[1]
         if imgui.button('Update'):
-            s.prompt = self.prompt_curr.replace('\n', ' ')
+            s.prompt = self.prompt_curr
+
+        if imgui.button('Export image'):
+            self.export_img()
 
 
 # Volatile state: requires recomputation of results
@@ -287,17 +335,19 @@ class ModelViz(ToolbarViewer):
 class UIState:
     pkl: str = 'models/ldm/stable-diffusion-v1/model.ckpt'
     T: int = 35
-    seed: int = 8
+    seed: int = 2
     B: int = 1
     guidance_scale: float = 7.5 # classifier guidance
     sampler_type: str = 'plms' # plms, ddim
-    prompt: str = 'A cyberpunk rubber duck swimming in money at a night club with sun glasses and a cigar. Neon lights, bokeh, dof, f 1/2.2, octane render, macro'
+    prompt: str = dedent('''
+        A guitar on fire,
+        sunset, nebula
+        ''').strip()
 
 @dataclass
 class RendererState:
     last_ui_state: UIState = None # Detect changes in UI, restart rendering
     model: LatentDiffusion = None
-    #img_samp_params: Dict[str, torch.Tensor] = None
     sampler: Union[PLMSSampler, DDIMSampler] = None
     intermed: torch.Tensor = None
     img_cache: Dict[Tuple[bool, int, int, int], torch.Tensor] = None
@@ -317,5 +367,5 @@ def init_torch():
 if __name__ == '__main__':
     download_weights()
     init_torch()
-    viewer = ModelViz('sdiff_viewer', hidden=False)
+    viewer = ModelViz('sdui', hidden=False)
     print('Done')
