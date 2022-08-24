@@ -1,3 +1,8 @@
+# Stable Diffusion UI
+<p align="center">
+<img src="assets/screenshot.png" alt="screenshot of user interface" width="1024"/>
+</p>
+
 # Setup
 
 How to:
