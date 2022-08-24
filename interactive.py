@@ -3,6 +3,8 @@ import imgui
 import torch
 import argparse
 import numpy as np
+import textwrap
+from sys import exit
 from multiprocessing import Lock
 from dataclasses import dataclass
 from copy import deepcopy
@@ -15,6 +17,7 @@ from pathlib import Path
 from glfw import KEY_LEFT_SHIFT
 from tqdm import trange
 from pytorch_lightning import seed_everything
+import gdown
 
 from omegaconf import OmegaConf
 from torch import autocast
@@ -54,6 +57,29 @@ def seeds_to_samples(seeds, shape=(1, 512)):
         latents[i] = rng.standard_normal(shape[1:])
     
     return torch.tensor(latents)
+
+def download_weights():
+    #src = 'https://drive.google.com/file/d/1F8R6C_63mM49vjYRoaAgMTtHRrwX3YhZ' #/view?usp=sharing'
+    trg = Path('models/ldm/stable-diffusion-v1/model.ckpt')
+    if trg.is_file():
+        return
+
+    resp = None
+    while resp not in ['yes', 'y', 'no', 'n']:
+        resp = input(textwrap.dedent(
+        '''
+        The model weights are licensed under the CreativeML OpenRAIL License.
+        Please read the full license here: https://huggingface.co/spaces/CompVis/stable-diffusion-license
+        Do you accept the terms? yes/no
+        '''))
+    
+    if resp in ['no', 'n']:
+        exit(-1)
+
+    makedirs(trg.parent, exist_ok=True)
+    gdown.download(id='1F8R6C_63mM49vjYRoaAgMTtHRrwX3YhZ', output=str(trg), quiet=False)
+    assert trg.is_file(), 'DL failed!'
+        
 
 def load_model_from_config(config, ckpt, verbose=False):
     print(f"Loading model from {ckpt}")
@@ -289,6 +315,7 @@ def init_torch():
     torch.backends.cudnn.allow_tf32 = False
 
 if __name__ == '__main__':
+    download_weights()
     init_torch()
     viewer = ModelViz('sdiff_viewer', hidden=False)
     print('Done')

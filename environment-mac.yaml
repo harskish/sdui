@@ -12,6 +12,7 @@ dependencies:
     - imgui[glfw]==1.4
     - albumentations==0.4.6
     - diffusers
+    - gdown
     - opencv-python==4.6.0.66
     - pudb==2019.2
     - imageio==2.9.0
