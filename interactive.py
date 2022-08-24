@@ -142,10 +142,12 @@ class ModelViz(ToolbarViewer):
 
     def setup_state(self):
         self.state = UIState()
+        self.state_soft = UIStateSoft()
         self.rend = RendererState()
         self.prompt_curr = self.state.prompt
         
         self.check_dataclass(self.state)
+        self.check_dataclass(self.state_soft)
         self.check_dataclass(self.rend)
     
     @lru_cache()
@@ -179,10 +181,12 @@ class ModelViz(ToolbarViewer):
         from dataclasses import asdict
         return {
             'state': asdict(self.state),
+            'state_soft': asdict(self.state_soft),
         }
 
-    def from_dict(self, state_dict):
-        state_dict = state_dict['state']
+    def from_dict(self, state_dict_in):
+        state_dict = state_dict_in['state']
+        state_dict_soft = state_dict_in['state_soft']
         
         # Ignore certain values
         ignores = []
@@ -190,11 +194,14 @@ class ModelViz(ToolbarViewer):
     
         for k, v in state_dict.items():
             setattr(self.state, k, v)
+        
+        for k, v in state_dict_soft.items():
+            setattr(self.state_soft, k, v)
 
         self.prompt_curr = self.state.prompt
 
     def export_img(self):
-        grid = reshape_grid(self.rend.intermed) # HWC
+        grid = reshape_grid(self.rend.intermed).contiguous() # HWC
         im = Image.fromarray(np.uint8(255*grid.clip(0,1).cpu().numpy()))
         metadata = json.dumps(self.to_dict, sort_keys=True)
         
@@ -212,7 +219,7 @@ class ModelViz(ToolbarViewer):
 
     # Progress bar below images
     def draw_output_extra(self):
-        self.rend.i = imgui.slider_int('', self.rend.i + 1, 1, self.rend.last_ui_state.T)[1] - 1
+        self.rend.i = imgui.slider_int('', self.rend.i, 0, self.rend.last_ui_state.T)[1]
 
     def compute(self):
         # Copy for this frame
@@ -275,15 +282,16 @@ class ModelViz(ToolbarViewer):
                     self.rend.c = model.get_learned_conditioning(s.B * [s.prompt.replace('\n', ' ')])
 
                 def cbk_img(img_curr, i):
-                    x_samples_ddim = model.decode_first_stage(img_curr)
-                    x_samples_ddim = torch.clamp((x_samples_ddim + 1.0) / 2.0, min=0.0, max=1.0) # [1, 3, 512, 512]
-                    grid = reshape_grid(x_samples_ddim) # => HWC
-                    grid = grid if grid.device.type == 'cuda' else grid.cpu().numpy()
-                    self.v.upload_image(self.output_key, grid)
+                    if self.state_soft.show_preview:
+                        x_samples_ddim = model.decode_first_stage(img_curr)
+                        x_samples_ddim = torch.clamp((x_samples_ddim + 1.0) / 2.0, min=0.0, max=1.0) # [1, 3, 512, 512]
+                        grid = reshape_grid(x_samples_ddim) # => HWC
+                        grid = grid if grid.device.type == 'cuda' else grid.cpu().numpy()
+                        self.v.upload_image(self.output_key, grid)
                     self.rend.i += 1
 
                 # Run image diffusion
-                samples_ddim, _ = self.rend.sampler.sample(S=s.T, conditioning=self.rend.c, batch_size=s.B,
+                samples_ddim, _ = self.rend.sampler.sample(S=s.T-1, conditioning=self.rend.c, batch_size=s.B,
                                                     shape=shape,
                                                     verbose=False,
                                                     unconditional_guidance_scale=s.guidance_scale,
@@ -322,6 +330,7 @@ class ModelViz(ToolbarViewer):
         s.B = imgui.input_int('B', s.B)[1]
         s.seed = max(0, imgui.input_int('Seed', s.seed, s.B, 1)[1])
         s.T = imgui.input_int('T_img', s.T, 1, jmp_large)[1]
+        self.state_soft.show_preview = imgui.checkbox('Interactive preview', self.state_soft.show_preview)[1]
         self.prompt_curr = imgui.input_text_multiline('Prompt', self.prompt_curr, buffer_length=2048)[1]
         if imgui.button('Update'):
             s.prompt = self.prompt_curr
@@ -343,6 +352,11 @@ class UIState:
         A guitar on fire,
         sunset, nebula
         ''').strip()
+
+# Non-volatile: changes don't force recomputation
+@dataclass
+class UIStateSoft:
+    show_preview: bool = True
 
 @dataclass
 class RendererState:
