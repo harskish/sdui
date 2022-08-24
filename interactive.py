@@ -24,6 +24,8 @@ from ldm.models.diffusion.ddim import DDIMSampler
 from ldm.models.diffusion.plms import PLMSSampler
 from ldm.models.diffusion.ddpm import LatentDiffusion
 
+from viewer.single_image_viewer import draw as draw_debug
+
 #args = None
 
 # Choose backend
@@ -89,6 +91,7 @@ class ModelViz(ToolbarViewer):
     def setup_state(self):
         self.state = UIState()
         self.rend = RendererState()
+        self.prompt_curr = self.state.prompt
         
         self.check_dataclass(self.state)
         self.check_dataclass(self.rend)
@@ -138,69 +141,75 @@ class ModelViz(ToolbarViewer):
             self.rend.i = 0
             res = 512 #model.image_size?
             self.rend.intermed = sample_normal((s.B, 3, res, res), s.seed).to(device) # spaial noise
+            # Conditioning based on prompt
+            self.rend.c = self.rend.uc = None
 
         # Check if work is done
         if self.rend.i >= s.T - 1:
             return None
 
         model = self.rend.model
-        cond = None
-            
-        ################
-        # Sample latents
-        ################
-        # keys = [(s.seed + i, s.lat_T) for i in range(s.B)]
-        # missing = [k[0] for k in keys if k not in self.rend.lat_cache]
-        # if missing:
-        #     latent_noise = seeds_to_samples(missing, (len(missing), 512)).to(model.dev_lat)
-        #     lats = model.sample_lat_loop(torch.tensor([[s.lat_T]], device=model.dev_lat), latent_noise)
-            
-        #     # Update cache
-        #     for seed, lat in zip(missing, lats):
-        #         self.rend.lat_cache[(seed, s.lat_T)] = lat
-        
-        # cond = torch.stack([self.rend.lat_cache[k].to(model.dev_img) for k in keys], dim=0)
-
-        # Prompt
-        data = [s.B * [s.prompt]]
-        start_code = None
 
         ###############################
         # TEST: STABLEDIFF
 
-        # Get conditioning
-        #if rend.cond = None:
-        #    pass
-        print('Setting global seed to', s.seed)
-        seed_everything(s.seed)
+        # Read from or write to cache
+        finished = [False]*s.B
+        for i, img in enumerate(self.rend.intermed):
+            key = (s.prompt, s.seed + i, s.T)
+            if key in self.rend.img_cache:
+                self.rend.intermed[i] = torch.tensor(self.rend.img_cache[key], device=device)
+                finished[i] = True
+        
+        # No need to compute?
+        #if all(finished):
+        #    return None
 
+        # Shapes
+        C = 4
+        f = 8
+        H = W = 512
+        shape = [C, H // f, W // f] # [C, H/f, W/f]; f = ds, c = latent channels
+
+        # Initial noise
+        keys = [(s.seed + i) for i in range(s.B)]
+        missing = [k for k in keys if k not in self.rend.lat_cache]
+        if missing:
+            noises = seeds_to_samples(missing, (len(missing), *shape)).to(device)
+            for seed, lat in zip(missing, noises):
+                self.rend.lat_cache[(seed)] = lat
+        
+        start_code = torch.stack([self.rend.lat_cache[k] for k in keys], dim=0)
+        
         precision_scope = autocast if device != 'mps' else nullcontext
         with precision_scope(device):
             with model.ema_scope():
-                all_samples = list()
-                #for n in trange(1, desc="Sampling"):
-                #for prompts in tqdm(data, desc="data"):
-                prompts = data[0]
-                uc = None
-                if s.guidance_scale != 1.0:
-                    uc = model.get_learned_conditioning(s.B * [""])
-                if isinstance(prompts, tuple):
-                    prompts = list(prompts)
-                c = model.get_learned_conditioning(prompts)
-                shape = [4, 512 // 8, 512 // 8] # [C, H/f, W/f]; f = ds, c = latent channels
-                samples_ddim, _ = self.rend.sampler.sample(S=s.T, conditioning=c, batch_size=s.B,
+                # Get conditioning
+                if self.rend.c is None:
+                    if s.guidance_scale != 1.0:
+                        self.rend.uc = model.get_learned_conditioning(s.B * [""])
+                    self.rend.c = model.get_learned_conditioning(s.B * [s.prompt])
+
+                def cbk_img(img_curr, i):
+                    x_samples_ddim = model.decode_first_stage(img_curr)
+                    x_samples_ddim = torch.clamp((x_samples_ddim + 1.0) / 2.0, min=0.0, max=1.0) # [1, 3, 512, 512]
+                    grid = reshape_grid(x_samples_ddim) # => HWC
+                    grid = grid if grid.device.type == 'cuda' else grid.cpu().numpy()
+                    self.v.upload_image(self.output_key, grid)
+                    self.rend.i += 1
+
+                # Run image diffusion
+                samples_ddim, _ = self.rend.sampler.sample(S=s.T, conditioning=self.rend.c, batch_size=s.B,
                                                     shape=shape,
                                                     verbose=False,
                                                     unconditional_guidance_scale=s.guidance_scale,
-                                                    unconditional_conditioning=uc,
+                                                    unconditional_conditioning=self.rend.uc,
                                                     eta=0.0, # ddim_eta, 0 = deterministic
-                                                    x_T=start_code)
+                                                    x_T=start_code,
+                                                    img_callback=cbk_img)
 
                 x_samples_ddim = model.decode_first_stage(samples_ddim)
                 x_samples_ddim = torch.clamp((x_samples_ddim + 1.0) / 2.0, min=0.0, max=1.0) # [1, 3, 512, 512]
-                # x_samples_ddim = x_samples_ddim.cpu().permute(0, 2, 3, 1).numpy() # [1, 512, 512, 3]
-                # x_checked_image = x_samples_ddim
-                # x_checked_image_torch = torch.from_numpy(x_checked_image).permute(0, 3, 1, 2) # [1, 3, 512, 512]
 
                 self.rend.intermed = x_samples_ddim
 
@@ -221,16 +230,11 @@ class ModelViz(ToolbarViewer):
         #self.rend.i += 1
         self.rend.i = s.T # stop
 
-        # Read from or write to cache
-        finished = [False]*s.B
+        # Write to cache
         for i, img in enumerate(self.rend.intermed):
-            key = (s.seed + i, s.T, s.lat_T)
-            if key in self.rend.img_cache:
-                self.rend.intermed[i] = torch.tensor(self.rend.img_cache[key], device=device)
-                finished[i] = True
-            elif self.rend.i >= s.T - 1:
-                if not torch.any(torch.isnan(img)): # MPS bug: sometimes contains NaNs that darken image
-                    self.rend.img_cache[key] = img.cpu().numpy()
+            key = (s.prompt, s.seed + i, s.T)
+            if not torch.any(torch.isnan(img)): # MPS bug: sometimes contains NaNs that darken image
+                self.rend.img_cache[key] = img.cpu().numpy()
 
         # Early exit
         if all(finished):
@@ -247,19 +251,21 @@ class ModelViz(ToolbarViewer):
         s.B = imgui.input_int('B', s.B)[1]
         s.seed = max(0, imgui.input_int('Seed', s.seed, s.B, 1)[1])
         s.T = imgui.input_int('T_img', s.T, 1, jmp_large)[1]
-        s.lat_T = imgui.input_int('T_lat', s.lat_T, 1, jmp_large)[1]
+        self.prompt_curr = imgui.input_text_multiline('Prompt', self.prompt_curr, buffer_length=2048)[1]
+        if imgui.button('Update'):
+            s.prompt = self.prompt_curr.replace('\n', ' ')
+
 
 # Volatile state: requires recomputation of results
 @dataclass
 class UIState:
     pkl: str = 'models/ldm/stable-diffusion-v1/model.ckpt'
-    T: int = 10
-    lat_T: int = 100
-    seed: int = 0
+    T: int = 35
+    seed: int = 8
     B: int = 1
     guidance_scale: float = 7.5 # classifier guidance
     sampler_type: str = 'plms' # plms, ddim
-    prompt: str = 'A sunset in Tokyo, cyberpunk, artstation'
+    prompt: str = 'A cyberpunk rubber duck swimming in money at a night club with sun glasses and a cigar. Neon lights, bokeh, dof, f 1/2.2, octane render, macro'
 
 @dataclass
 class RendererState:
