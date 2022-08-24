@@ -1,23 +1,19 @@
-# Apple Silicon Mac Users
-
-These are Apple Silicon instructions. I haven't tested any of this on Intel Macs.
-
-Please discuss issues with Apple Silicon [here](https://github.com/CompVis/stable-diffusion/issues/25).
+# Setup
 
 How to:
 
-```
-git clone https://github.com/magnusviri/stable-diffusion.git
-cd stable-diffusion
-git checkout apple-silicon-mps-support
-```
+1. Install Anaconda / Miniconda
+2. `git clone --recursive https://github.com/harskish/sdui.git && cd sdui`
+3. MacOS: `conda env create -f environment-mac.yaml`, other: `conda env create -f environment.yaml`.
+4. `conda activate ldm`
+5. `python interactive.py`
 
-Follow the normal instructions below but instead of running `conda env create -f environment.yaml` run `conda env create -f environment-mac.yaml`.
+### MacOS
 
-After you follow all the instructions, if you run txt2img.py you might get an error like the following.
+If you run interactive.py you might get an error like the following.
 
 ```
-  File "/opt/anaconda3/envs/ldm/lib/python3.10/site-packages/torch/nn/functional.py", line 2511, in layer_norm
+File "/opt/anaconda3/envs/ldm/lib/python3.10/site-packages/torch/nn/functional.py", line 2511, in layer_norm
     return torch.layer_norm(input, normalized_shape, weight, bias, eps, torch.backends.cudnn.enabled)
 RuntimeError: view size is not compatible with input tensor's size and stride (at least one dimension spans across two contiguous subspaces). Use .reshape(...) instead.
 ```
