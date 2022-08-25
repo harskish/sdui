@@ -250,8 +250,11 @@ class viewer:
         self._context_lock = mp.Lock()
 
     def get_default_font(self):
-        #return str(Path(__file__).parent / 'roboto_mono.ttf')
-        return str(Path(__file__).parent / 'MPLUSRounded1c-Medium.ttf')
+        from platform import system
+        if system() == 'Darwin':
+            return str(Path(__file__).parent / 'roboto_mono.ttf')
+        else:
+            return str(Path(__file__).parent / 'MPLUSRounded1c-Medium.ttf')
 
     
     def push_context(self):
