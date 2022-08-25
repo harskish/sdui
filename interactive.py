@@ -275,8 +275,8 @@ class ModelViz(ToolbarViewer):
             return grid
 
         # Initial noise
-        keys = [(s.seed + i, s.H, s.W) for i in range(s.B)]
-        start_code = seeds_to_samples(keys, (len(keys), *shape)).to(device)
+        seeds = [s.seed + i for i in range(s.B)]
+        start_code = seeds_to_samples(seeds, (len(seeds), *shape)).to(device)
         
         class UserAbort(Exception):
             pass
