@@ -3,6 +3,10 @@
 <img src="assets/screenshot.png" alt="screenshot of user interface" width="1024"/>
 </p>
 
+# Features
+* Drag-and-drop reloading of UI state from exported images
+* Result caching to maximize responsiveness
+
 # Setup
 
 How to:
