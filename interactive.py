@@ -101,7 +101,7 @@ def download_weights():
     gdown.download(id=id, output=str(trg), quiet=False)
     assert trg.is_file(), 'DL failed!'
 
-def load_model_from_config(config, ckpt, verbose=False):
+def load_model_from_config(config, ckpt, use_half=False, verbose=True):
     print(f'Loading model from {ckpt}')
     pl_sd = torch.load(ckpt, map_location='cpu')
     sd = pl_sd['state_dict']
@@ -115,12 +115,11 @@ def load_model_from_config(config, ckpt, verbose=False):
         print('unexpected keys:')
         print(u)
 
+    if use_half:
+        model.half()
+
     model.to(device)
     model.eval()
-
-    if device == 'cuda':
-        print('Using half precision globally')
-        model.half() # TODO: effect on quality?
 
     # Switch to EMA weights
     if model.use_ema:
@@ -130,9 +129,9 @@ def load_model_from_config(config, ckpt, verbose=False):
     return model
 
 @lru_cache()
-def get_model(pkl):
+def get_model(pkl, use_half):
     config = OmegaConf.load('configs/stable-diffusion/v1-inference.yaml')
-    model = load_model_from_config(config, pkl)
+    model = load_model_from_config(config, pkl, use_half)
     return model
 
 class ModelViz(ToolbarViewer):    
@@ -157,6 +156,10 @@ class ModelViz(ToolbarViewer):
         self.state_soft = UIStateSoft()
         self.rend = RendererState()
         self.prompt_curr = self.state.prompt
+
+        if device == 'cuda':
+            print('Using half precision globally')
+            self.state.fp16 = True
         
         self.check_dataclass(self.state)
         self.check_dataclass(self.state_soft)
@@ -172,7 +175,7 @@ class ModelViz(ToolbarViewer):
             raise RuntimeError('Unknown sampler type')
 
     def init_model(self, pkl) -> LatentDiffusion:
-        model = get_model(pkl)
+        model = get_model(pkl, self.state.fp16)
 
         # Reset caches
         prev = self.rend.model
@@ -351,6 +354,7 @@ class UIState:
     B: int = 1
     H: int = 512
     W: int = 512
+    fp16: int = False
     guidance_scale: float = 8.0 # classifier guidance
     sampler_type: str = 'ddim' # plms, ddim
     prompt: str = dedent('''
