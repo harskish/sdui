@@ -300,7 +300,8 @@ class ModelViz(ToolbarViewer):
                         raise UserAbort
                     
                     # Always show after last iter
-                    if self.state_soft.show_preview or self.rend.i >= s.T:
+                    p = self.state_soft.preview_interval
+                    if self.rend.i >= s.T or (p > 0 and i % p == 0):
                         x_samples_ddim = model.decode_first_stage(img_curr)
                         self.rend.intermed = torch.clamp((x_samples_ddim + 1.0) / 2.0, min=0.0, max=1.0) # [1, 3, 512, 512]
                         grid = reshape_grid(self.rend.intermed) # => HWC
@@ -331,9 +332,9 @@ class ModelViz(ToolbarViewer):
         s.seed = max(0, imgui.input_int('Seed', s.seed, s.B, 1)[1])
         s.T = imgui.input_int('T_img', s.T, 1, jmp_large)[1]
         scale_fmt = '%.2f' if np.modf(s.guidance_scale)[0] > 0 else '%.0f' # dynamically change from ints to floats
-        s.guidance_scale = imgui.slider_float('Guidance', s.guidance_scale, 0, 20, format=scale_fmt)[1]
         s.sampler_type = combo_box_vals('Sampler', ['ddim', 'plms'], s.sampler_type)[1]
-        self.state_soft.show_preview = imgui.checkbox('Interactive preview', self.state_soft.show_preview)[1]
+        s.guidance_scale = imgui.slider_float('Guidance', s.guidance_scale, 0, 20, format=scale_fmt)[1]
+        self.state_soft.preview_interval = imgui.slider_int('Preview interval', self.state_soft.preview_interval, 0, 10)[1]
         self.prompt_curr = imgui.input_text_multiline('Prompt', self.prompt_curr, buffer_length=2048)[1]
         if imgui.button('Update'):
             s.prompt = self.prompt_curr
@@ -347,19 +348,19 @@ class ModelViz(ToolbarViewer):
 class UIState:
     pkl: str = 'models/ldm/stable-diffusion-v1/model.ckpt'
     T: int = 35
-    seed: int = 2
+    seed: int = 0
     B: int = 1
     guidance_scale: float = 8.0 # classifier guidance
-    sampler_type: str = 'plms' # plms, ddim
+    sampler_type: str = 'ddim' # plms, ddim
     prompt: str = dedent('''
-        A guitar on fire,
-        sunset, nebula
+        東京, 吹雪, 夕方,
+        National Geographic
         ''').strip()
 
 # Non-volatile: changes don't force recomputation
 @dataclass
 class UIStateSoft:
-    show_preview: bool = True
+    preview_interval: int = 5
 
 @dataclass
 class RendererState:
