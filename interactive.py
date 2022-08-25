@@ -12,6 +12,7 @@ from viewer.toolbar_viewer import ToolbarViewer
 from viewer.utils import reshape_grid, combo_box_vals
 from typing import Dict, Tuple, Union
 from os import makedirs
+from dataclasses import asdict
 from pathlib import Path
 from glfw import KEY_LEFT_SHIFT
 import gdown
@@ -174,7 +175,6 @@ class ModelViz(ToolbarViewer):
 
     @property
     def to_dict(self):
-        from dataclasses import asdict
         return {
             'state': asdict(self.state),
             'state_soft': asdict(self.state_soft),
@@ -235,22 +235,30 @@ class ModelViz(ToolbarViewer):
             self.rend.c = self.rend.uc = None
 
         # Check if work is done
-        if self.rend.i >= s.T - 1:
+        if self.rend.i >= s.T:
             return None
 
         model = self.rend.model
 
+        def cache_key(s, i: int):
+            meta = asdict(s)
+            meta['seed'] += i
+            return json.dumps(meta)
+
         # Read from or write to cache
         finished = [False]*s.B
         for i, img in enumerate(self.rend.intermed):
-            key = (s.prompt, s.seed + i, s.T)
+            key = cache_key(s, i)
             if key in self.rend.img_cache:
                 self.rend.intermed[i] = torch.tensor(self.rend.img_cache[key], device=device)
                 finished[i] = True
         
         # No need to compute?
-        #if all(finished):
-        #    return None
+        if all(finished):
+            self.rend.i = s.T
+            grid = reshape_grid(self.rend.intermed) # => HWC
+            grid = grid if grid.device.type == 'cuda' else grid.cpu().numpy()
+            return grid
 
         # Shapes
         C = 4
@@ -268,56 +276,47 @@ class ModelViz(ToolbarViewer):
         
         start_code = torch.stack([self.rend.lat_cache[k] for k in keys], dim=0)
         
-        precision_scope = autocast if device != 'mps' else nullcontext
-        with precision_scope(device):
-            with model.ema_scope():
-                # Get conditioning
-                if self.rend.c is None:
-                    if s.guidance_scale != 1.0:
-                        self.rend.uc = model.get_learned_conditioning(s.B * [""])
-                    self.rend.c = model.get_learned_conditioning(s.B * [s.prompt.replace('\n', ' ')])
+        class UserAbort(Exception):
+            pass
 
-                def cbk_img(img_curr, i):
-                    if self.state_soft.show_preview:
-                        x_samples_ddim = model.decode_first_stage(img_curr)
-                        x_samples_ddim = torch.clamp((x_samples_ddim + 1.0) / 2.0, min=0.0, max=1.0) # [1, 3, 512, 512]
-                        grid = reshape_grid(x_samples_ddim) # => HWC
-                        grid = grid if grid.device.type == 'cuda' else grid.cpu().numpy()
-                        self.v.upload_image(self.output_key, grid)
-                    self.rend.i += 1
+        try:
+            precision_scope = autocast if device != 'mps' else nullcontext
+            with precision_scope(device):
+                with model.ema_scope():
+                    # Get conditioning
+                    if self.rend.c is None:
+                        if s.guidance_scale != 1.0:
+                            self.rend.uc = model.get_learned_conditioning(s.B * [""])
+                        self.rend.c = model.get_learned_conditioning(s.B * [s.prompt.replace('\n', ' ')])
 
-                # Run image diffusion
-                samples_ddim, _ = self.rend.sampler.sample(S=s.T-1, conditioning=self.rend.c, batch_size=s.B,
-                                                    shape=shape,
-                                                    verbose=False,
-                                                    unconditional_guidance_scale=s.guidance_scale,
-                                                    unconditional_conditioning=self.rend.uc,
-                                                    eta=0.0, # ddim_eta, 0 = deterministic
-                                                    x_T=start_code,
-                                                    img_callback=cbk_img)
+                    def cbk_img(img_curr, i):
+                        self.rend.i = i + 1
+                        if s != self.state:
+                            raise UserAbort
+                        
+                        # Always show after last iter
+                        if self.state_soft.show_preview or self.rend.i >= s.T:
+                            x_samples_ddim = model.decode_first_stage(img_curr)
+                            self.rend.intermed = torch.clamp((x_samples_ddim + 1.0) / 2.0, min=0.0, max=1.0) # [1, 3, 512, 512]
+                            grid = reshape_grid(self.rend.intermed) # => HWC
+                            grid = grid if grid.device.type == 'cuda' else grid.cpu().numpy()
+                            self.v.upload_image(self.output_key, grid)
 
-                x_samples_ddim = model.decode_first_stage(samples_ddim)
-                x_samples_ddim = torch.clamp((x_samples_ddim + 1.0) / 2.0, min=0.0, max=1.0) # [1, 3, 512, 512]
-
-                self.rend.intermed = x_samples_ddim
-        
-        # Move on to next iteration
-        #self.rend.i += 1
-        self.rend.i = s.T # stop
+                    # Run image diffusion
+                    self.rend.sampler.sample(S=s.T, conditioning=self.rend.c, batch_size=s.B,
+                        shape=shape, verbose=False, unconditional_guidance_scale=s.guidance_scale,
+                        unconditional_conditioning=self.rend.uc, eta=0.0, x_T=start_code, img_callback=cbk_img)
+        except UserAbort:
+            # UI state changed, restart rendering            
+            return None
 
         # Write to cache
         for i, img in enumerate(self.rend.intermed):
-            key = (s.prompt, s.seed + i, s.T)
+            key = cache_key(s, i)
             if not torch.any(torch.isnan(img)): # MPS bug: sometimes contains NaNs that darken image
                 self.rend.img_cache[key] = img.cpu().numpy()
 
-        # Early exit
-        if all(finished):
-            self.rend.i = s.T - 1
-        
-        # Output updated grid
-        grid = reshape_grid(self.rend.intermed) # => HWC
-        return grid if grid.device.type == 'cuda' else grid.cpu().numpy()
+        return None
     
     def draw_toolbar(self):
         jmp_large = 100 if self.v.keydown(KEY_LEFT_SHIFT) else 10
