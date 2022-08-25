@@ -296,7 +296,7 @@ class ModelViz(ToolbarViewer):
 
                 def cbk_img(img_curr, i):
                     self.rend.i = i + 1
-                    if s != self.state:
+                    if s != self.state or glfw.window_should_close(self.v._window):
                         raise UserAbort
                     
                     # Always show after last iter
@@ -319,7 +319,7 @@ class ModelViz(ToolbarViewer):
         # Write to cache
         for i, img in enumerate(self.rend.intermed):
             key = cache_key(s, i)
-            if not torch.any(torch.isnan(img)): # MPS bug: sometimes contains NaNs that darken image
+            if not (torch.any(torch.isnan(img)) or torch.all(img == 0)):
                 self.rend.img_cache[key] = img.cpu().numpy()
 
         return None

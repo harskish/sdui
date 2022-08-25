@@ -244,18 +244,13 @@ class viewer:
         # TERO
         self._imgui_context = imgui.create_context()
         font = self.get_default_font()
-        font_sizes = {int(size) for size in range(10, 31)}
+        font_sizes = {int(size) for size in range(8, 36, 2)} # Apple M1 has limit on GL textures
         self._imgui_fonts = {size: imgui.get_io().fonts.add_font_from_file_ttf(font, size, imgui.get_io().fonts.get_glyph_ranges_chinese_full()) for size in font_sizes}
 
         self._context_lock = mp.Lock()
 
     def get_default_font(self):
-        from platform import system
-        if system() == 'Darwin':
-            return str(Path(__file__).parent / 'roboto_mono.ttf')
-        else:
-            return str(Path(__file__).parent / 'MPLUSRounded1c-Medium.ttf')
-
+        return str(Path(__file__).parent / 'MPLUSRounded1c-Medium.ttf')
     
     def push_context(self):
         if has_pycuda:
@@ -418,9 +413,12 @@ class viewer:
         if glfw_init_callback is not None:
             glfw_init_callback(self._window)
 
-        while not (glfw.window_should_close(self._window) or self.keyhit(glfw.KEY_ESCAPE)):
+        while not glfw.window_should_close(self._window):
             glfw.poll_events()
             impl.process_inputs()
+
+            if self.keyhit(glfw.KEY_ESCAPE):
+                glfw.set_window_should_close(self._window, 1)
 
             self._lock() # calls make_context_current()
             
