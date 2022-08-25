@@ -1,7 +1,6 @@
 import os
 import imgui
 import torch
-import argparse
 import numpy as np
 from textwrap import dedent
 from sys import exit
@@ -117,6 +116,11 @@ def load_model_from_config(config, ckpt, verbose=False):
 
     model.to(device)
     model.eval()
+
+    # Switch to EMA weights
+    if model.use_ema:
+        model.model_ema.store(model.model.parameters())
+        model.model_ema.copy_to(model.model)
     
     return model
 
@@ -170,6 +174,7 @@ class ModelViz(ToolbarViewer):
         if not prev or model.ckpt != prev.ckpt:
             self.rend.lat_cache = {}
             self.rend.img_cache = {}
+            self.rend.cond_cache = {}
 
         return model
 
@@ -231,8 +236,6 @@ class ModelViz(ToolbarViewer):
             self.rend.i = 0
             res = 512 #model.image_size?
             self.rend.intermed = sample_normal((s.B, 3, res, res), s.seed).to(device) # spaial noise
-            # Conditioning based on prompt
-            self.rend.c = self.rend.uc = None
 
         # Check if work is done
         if self.rend.i >= s.T:
@@ -282,30 +285,32 @@ class ModelViz(ToolbarViewer):
         try:
             precision_scope = autocast if device != 'mps' else nullcontext
             with precision_scope(device):
-                with model.ema_scope():
-                    # Get conditioning
-                    if self.rend.c is None:
-                        if s.guidance_scale != 1.0:
-                            self.rend.uc = model.get_learned_conditioning(s.B * [""])
-                        self.rend.c = model.get_learned_conditioning(s.B * [s.prompt.replace('\n', ' ')])
+                # Get conditioning
+                prompt = s.prompt.replace('\n', ' ')
+                cond_key = (prompt, s.guidance_scale)
+                if cond_key not in self.rend.cond_cache:
+                    uc = None if s.guidance_scale == 1.0 else model.get_learned_conditioning(s.B * [""])
+                    c = model.get_learned_conditioning(s.B * [prompt])
+                    self.rend.cond_cache[cond_key] = (uc, c)
+                uc, c = self.rend.cond_cache[cond_key]
 
-                    def cbk_img(img_curr, i):
-                        self.rend.i = i + 1
-                        if s != self.state:
-                            raise UserAbort
-                        
-                        # Always show after last iter
-                        if self.state_soft.show_preview or self.rend.i >= s.T:
-                            x_samples_ddim = model.decode_first_stage(img_curr)
-                            self.rend.intermed = torch.clamp((x_samples_ddim + 1.0) / 2.0, min=0.0, max=1.0) # [1, 3, 512, 512]
-                            grid = reshape_grid(self.rend.intermed) # => HWC
-                            grid = grid if grid.device.type == 'cuda' else grid.cpu().numpy()
-                            self.v.upload_image(self.output_key, grid)
+                def cbk_img(img_curr, i):
+                    self.rend.i = i + 1
+                    if s != self.state:
+                        raise UserAbort
+                    
+                    # Always show after last iter
+                    if self.state_soft.show_preview or self.rend.i >= s.T:
+                        x_samples_ddim = model.decode_first_stage(img_curr)
+                        self.rend.intermed = torch.clamp((x_samples_ddim + 1.0) / 2.0, min=0.0, max=1.0) # [1, 3, 512, 512]
+                        grid = reshape_grid(self.rend.intermed) # => HWC
+                        grid = grid if grid.device.type == 'cuda' else grid.cpu().numpy()
+                        self.v.upload_image(self.output_key, grid)
 
-                    # Run image diffusion
-                    self.rend.sampler.sample(S=s.T, conditioning=self.rend.c, batch_size=s.B,
-                        shape=shape, verbose=False, unconditional_guidance_scale=s.guidance_scale,
-                        unconditional_conditioning=self.rend.uc, eta=0.0, x_T=start_code, img_callback=cbk_img)
+                # Run image diffusion
+                self.rend.sampler.sample(S=s.T, conditioning=c, batch_size=s.B,
+                    shape=shape, verbose=False, unconditional_guidance_scale=s.guidance_scale,
+                    unconditional_conditioning=uc, eta=0.0, x_T=start_code, img_callback=cbk_img)
         except UserAbort:
             # UI state changed, restart rendering            
             return None
@@ -360,8 +365,9 @@ class RendererState:
     model: LatentDiffusion = None
     sampler: Union[PLMSSampler, DDIMSampler] = None
     intermed: torch.Tensor = None
-    img_cache: Dict[Tuple[bool, int, int, int], torch.Tensor] = None
-    lat_cache: Dict[Tuple[int, int], torch.Tensor] = None
+    img_cache: Dict[str, torch.Tensor] = None
+    lat_cache: Dict[int, torch.Tensor] = None
+    cond_cache: Dict[Tuple[str, float], Tuple[torch.Tensor, torch.Tensor]] = None
     i: int = 0 # current computation progress
 
 def init_torch():
