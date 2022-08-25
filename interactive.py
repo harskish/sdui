@@ -5,7 +5,6 @@ import argparse
 import numpy as np
 from textwrap import dedent
 from sys import exit
-from multiprocessing import Lock
 from dataclasses import dataclass
 from copy import deepcopy
 from functools import lru_cache
@@ -15,8 +14,6 @@ from typing import Dict, Tuple, Union
 from os import makedirs
 from pathlib import Path
 from glfw import KEY_LEFT_SHIFT
-from tqdm import trange
-from pytorch_lightning import seed_everything
 import gdown
 import glfw
 from functools import partial
@@ -26,7 +23,7 @@ from PIL import Image
 
 from omegaconf import OmegaConf
 from torch import autocast
-from contextlib import contextmanager, nullcontext
+from contextlib import nullcontext
 from ldm.util import instantiate_from_config
 from ldm.models.diffusion.ddim import DDIMSampler
 from ldm.models.diffusion.plms import PLMSSampler
@@ -82,7 +79,7 @@ def seeds_to_samples(seeds, shape=(1, 512)):
     return torch.tensor(latents)
 
 def download_weights():
-    #src = 'https://drive.google.com/file/d/1F8R6C_63mM49vjYRoaAgMTtHRrwX3YhZ' #/view?usp=sharing'
+    id = '1F8R6C_63mM49vjYRoaAgMTtHRrwX3YhZ' # sd-v1-4.ckpt
     trg = Path('models/ldm/stable-diffusion-v1/model.ckpt')
     if trg.is_file():
         return
@@ -100,27 +97,26 @@ def download_weights():
         exit(-1)
 
     makedirs(trg.parent, exist_ok=True)
-    gdown.download(id='1F8R6C_63mM49vjYRoaAgMTtHRrwX3YhZ', output=str(trg), quiet=False)
+    gdown.download(id=id, output=str(trg), quiet=False)
     assert trg.is_file(), 'DL failed!'
 
 def load_model_from_config(config, ckpt, verbose=False):
-    print(f"Loading model from {ckpt}")
-    pl_sd = torch.load(ckpt, map_location="cpu")
-    if "global_step" in pl_sd:
-        print(f"Global Step: {pl_sd['global_step']}")
-    sd = pl_sd["state_dict"]
+    print(f'Loading model from {ckpt}')
+    pl_sd = torch.load(ckpt, map_location='cpu')
+    sd = pl_sd['state_dict']
     model = instantiate_from_config(config.model)
     setattr(model, 'ckpt', ckpt)
     m, u = model.load_state_dict(sd, strict=False)
     if len(m) > 0 and verbose:
-        print("missing keys:")
+        print('missing keys:')
         print(m)
     if len(u) > 0 and verbose:
-        print("unexpected keys:")
+        print('unexpected keys:')
         print(u)
 
     model.to(device)
     model.eval()
+    
     return model
 
 class ModelViz(ToolbarViewer):    
@@ -330,6 +326,7 @@ class ModelViz(ToolbarViewer):
         s.B = imgui.input_int('B', s.B)[1]
         s.seed = max(0, imgui.input_int('Seed', s.seed, s.B, 1)[1])
         s.T = imgui.input_int('T_img', s.T, 1, jmp_large)[1]
+        s.sampler_type = combo_box_vals('Sampler', ['ddim', 'plms'], s.sampler_type)[1]
         self.state_soft.show_preview = imgui.checkbox('Interactive preview', self.state_soft.show_preview)[1]
         self.prompt_curr = imgui.input_text_multiline('Prompt', self.prompt_curr, buffer_length=2048)[1]
         if imgui.button('Update'):
