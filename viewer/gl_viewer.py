@@ -245,12 +245,14 @@ class viewer:
         self._imgui_context = imgui.create_context()
         font = self.get_default_font()
         font_sizes = {int(size) for size in range(10, 31)}
-        self._imgui_fonts = {size: imgui.get_io().fonts.add_font_from_file_ttf(font, size) for size in font_sizes}
+        self._imgui_fonts = {size: imgui.get_io().fonts.add_font_from_file_ttf(font, size, imgui.get_io().fonts.get_glyph_ranges_chinese_full()) for size in font_sizes}
 
         self._context_lock = mp.Lock()
 
     def get_default_font(self):
-        return str(Path(__file__).parent / 'roboto_mono.ttf')
+        #return str(Path(__file__).parent / 'roboto_mono.ttf')
+        return str(Path(__file__).parent / 'MPLUSRounded1c-Medium.ttf')
+
     
     def push_context(self):
         if has_pycuda:

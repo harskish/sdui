@@ -331,7 +331,7 @@ class ModelViz(ToolbarViewer):
         s.seed = max(0, imgui.input_int('Seed', s.seed, s.B, 1)[1])
         s.T = imgui.input_int('T_img', s.T, 1, jmp_large)[1]
         scale_fmt = '%.2f' if np.modf(s.guidance_scale)[0] > 0 else '%.0f' # dynamically change from ints to floats
-        s.guidance_scale = imgui.slider_float('Guidance', s.guidance_scale, 0, 30, format=scale_fmt)[1]
+        s.guidance_scale = imgui.slider_float('Guidance', s.guidance_scale, 0, 20, format=scale_fmt)[1]
         s.sampler_type = combo_box_vals('Sampler', ['ddim', 'plms'], s.sampler_type)[1]
         self.state_soft.show_preview = imgui.checkbox('Interactive preview', self.state_soft.show_preview)[1]
         self.prompt_curr = imgui.input_text_multiline('Prompt', self.prompt_curr, buffer_length=2048)[1]
