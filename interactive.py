@@ -28,10 +28,11 @@ from ldm.util import instantiate_from_config
 from ldm.models.diffusion.ddim import DDIMSampler
 from ldm.models.diffusion.plms import PLMSSampler
 from ldm.models.diffusion.ddpm import LatentDiffusion
-
 from viewer.single_image_viewer import draw as draw_debug
 
-#args = None
+# Suppress CLIP warning
+import transformers
+transformers.logging.set_verbosity_error()
 
 # Choose backend
 device = 'cpu'
@@ -117,11 +118,21 @@ def load_model_from_config(config, ckpt, verbose=False):
     model.to(device)
     model.eval()
 
+    if device == 'cuda':
+        print('Using half precision globally')
+        model.half() # TODO: effect on quality?
+
     # Switch to EMA weights
     if model.use_ema:
         model.model_ema.store(model.model.parameters())
         model.model_ema.copy_to(model.model)
     
+    return model
+
+@lru_cache()
+def get_model(pkl):
+    config = OmegaConf.load('configs/stable-diffusion/v1-inference.yaml')
+    model = load_model_from_config(config, pkl)
     return model
 
 class ModelViz(ToolbarViewer):    
@@ -150,12 +161,6 @@ class ModelViz(ToolbarViewer):
         self.check_dataclass(self.state)
         self.check_dataclass(self.state_soft)
         self.check_dataclass(self.rend)
-    
-    @lru_cache()
-    def _get_model(self, pkl):
-        config = OmegaConf.load('configs/stable-diffusion/v1-inference.yaml')
-        model = load_model_from_config(config, pkl)
-        return model
 
     def init_sampler(self, model):
         stype = self.state.sampler_type
@@ -167,12 +172,11 @@ class ModelViz(ToolbarViewer):
             raise RuntimeError('Unknown sampler type')
 
     def init_model(self, pkl) -> LatentDiffusion:
-        model = self._get_model(pkl)
+        model = get_model(pkl)
 
         # Reset caches
         prev = self.rend.model
         if not prev or model.ckpt != prev.ckpt:
-            self.rend.lat_cache = {}
             self.rend.img_cache = {}
             self.rend.cond_cache = {}
 
@@ -226,6 +230,11 @@ class ModelViz(ToolbarViewer):
         # Copy for this frame
         s = deepcopy(self.state)
 
+        # Shapes
+        C = 4
+        f = 8
+        shape = [C, s.H // f, s.W // f] # [C, H/f, W/f]; f = ds, c = latent channels
+
         # Perform computation
         # Detect changes
         # Only works for fields annotated with type (e.g. sliders: list)
@@ -234,8 +243,7 @@ class ModelViz(ToolbarViewer):
             self.rend.model = self.init_model(s.pkl)
             self.rend.sampler = self.init_sampler(self.rend.model)
             self.rend.i = 0
-            res = 512 #model.image_size?
-            self.rend.intermed = sample_normal((s.B, 3, res, res), s.seed).to(device) # spaial noise
+            self.rend.intermed = torch.zeros(s.B, 3, s.H, s.W, device=device)
 
         # Check if work is done
         if self.rend.i >= s.T:
@@ -263,21 +271,9 @@ class ModelViz(ToolbarViewer):
             grid = grid if grid.device.type == 'cuda' else grid.cpu().numpy()
             return grid
 
-        # Shapes
-        C = 4
-        f = 8
-        H = W = 512
-        shape = [C, H // f, W // f] # [C, H/f, W/f]; f = ds, c = latent channels
-
         # Initial noise
-        keys = [(s.seed + i) for i in range(s.B)]
-        missing = [k for k in keys if k not in self.rend.lat_cache]
-        if missing:
-            noises = seeds_to_samples(missing, (len(missing), *shape)).to(device)
-            for seed, lat in zip(missing, noises):
-                self.rend.lat_cache[(seed)] = lat
-        
-        start_code = torch.stack([self.rend.lat_cache[k] for k in keys], dim=0)
+        keys = [(s.seed + i, s.H, s.W) for i in range(s.B)]
+        start_code = seeds_to_samples(keys, (len(keys), *shape)).to(device)
         
         class UserAbort(Exception):
             pass
@@ -307,13 +303,14 @@ class ModelViz(ToolbarViewer):
                         grid = reshape_grid(self.rend.intermed) # => HWC
                         grid = grid if grid.device.type == 'cuda' else grid.cpu().numpy()
                         self.v.upload_image(self.output_key, grid)
+                        self.img_shape = self.rend.intermed.shape[1:]
 
                 # Run image diffusion
                 self.rend.sampler.sample(S=s.T, conditioning=c, batch_size=s.B,
                     shape=shape, verbose=False, unconditional_guidance_scale=s.guidance_scale,
                     unconditional_conditioning=uc, eta=0.0, x_T=start_code, img_callback=cbk_img)
         except UserAbort:
-            # UI state changed, restart rendering            
+            # UI state changed, restart rendering
             return None
 
         # Write to cache
@@ -331,6 +328,8 @@ class ModelViz(ToolbarViewer):
         s.B = imgui.input_int('B', s.B)[1]
         s.seed = max(0, imgui.input_int('Seed', s.seed, s.B, 1)[1])
         s.T = imgui.input_int('T_img', s.T, 1, jmp_large)[1]
+        s.H = combo_box_vals('H', list(range(64, 2048, 64)), s.H, to_str=str)[1]
+        s.W = combo_box_vals('W', list(range(64, 2048, 64)), s.W, to_str=str)[1]
         scale_fmt = '%.2f' if np.modf(s.guidance_scale)[0] > 0 else '%.0f' # dynamically change from ints to floats
         s.sampler_type = combo_box_vals('Sampler', ['ddim', 'plms'], s.sampler_type)[1]
         s.guidance_scale = imgui.slider_float('Guidance', s.guidance_scale, 0, 20, format=scale_fmt)[1]
@@ -350,6 +349,8 @@ class UIState:
     T: int = 35
     seed: int = 0
     B: int = 1
+    H: int = 512
+    W: int = 512
     guidance_scale: float = 8.0 # classifier guidance
     sampler_type: str = 'ddim' # plms, ddim
     prompt: str = dedent('''
@@ -369,7 +370,6 @@ class RendererState:
     sampler: Union[PLMSSampler, DDIMSampler] = None
     intermed: torch.Tensor = None
     img_cache: Dict[str, torch.Tensor] = None
-    lat_cache: Dict[int, torch.Tensor] = None
     cond_cache: Dict[Tuple[str, float], Tuple[torch.Tensor, torch.Tensor]] = None
     i: int = 0 # current computation progress
 
