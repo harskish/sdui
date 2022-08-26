@@ -389,10 +389,6 @@ class ModelViz(ToolbarViewer):
                         self.v.upload_image(self.output_key, grid)
                         self.img_shape = self.rend.intermed.shape[1:]
                 
-                # Initial noise
-                seeds = [s.seed + i for i in range(s.B)]
-                start_code = seeds_to_samples(seeds, (len(seeds), *shape)).to(device)
-                
                 if s.image_cond is not None:
                     # Image conditioning
                     arr = np.array(s.image_cond, dtype=np.float16).reshape([1, *shape])
@@ -402,10 +398,19 @@ class ModelViz(ToolbarViewer):
                     strength = 1 - (s.image_cond_strength - 1) / 10 # [1, 10] => [0, 9] => [1.0, 0.1]
                     t_enc = max(1, int(strength * s.T))
                     self.rend.sampler.make_schedule(s.T, ddim_eta=0.0, verbose=False)
-                    z_enc = self.rend.sampler.stochastic_encode(t, torch.tensor([t_enc]*s.B).to(device), noise=start_code)
+
+                    # Image suffers if using same noise in encode and cond image generation
+                    # => make sure sequences differ
+                    seeds = [(1<<32 - 1) - s.seed - i for i in range(s.B)] # reverse order starting at max seed
+                    noises = seeds_to_samples(seeds, (len(seeds), *shape)).to(device)
+                    z_enc = self.rend.sampler.stochastic_encode(t, torch.tensor([t_enc]*s.B).to(device), noise=noises)
                     self.rend.sampler.decode(z_enc, c, t_enc, unconditional_conditioning=uc, 
                         unconditional_guidance_scale=s.guidance_scale, img_callback=cbk_img)
                 else:
+                    # Initial noise
+                    seeds = [s.seed + i for i in range(s.B)]
+                    start_code = seeds_to_samples(seeds, (len(seeds), *shape)).to(device)
+
                     # Random initial noise
                     self.rend.sampler.sample(S=s.T, conditioning=c, batch_size=s.B,
                         shape=shape, verbose=False, unconditional_guidance_scale=s.guidance_scale,
