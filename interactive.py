@@ -9,15 +9,17 @@ from copy import deepcopy
 from functools import lru_cache
 from viewer.toolbar_viewer import ToolbarViewer
 from viewer.utils import reshape_grid, combo_box_vals
-from typing import Dict, Tuple, Union
+from typing import Dict, Tuple, Union, List
 from os import makedirs
 from dataclasses import asdict
 from pathlib import Path
 from glfw import KEY_LEFT_SHIFT
 import gdown
 import glfw
+import hashlib
 from functools import partial
 from PIL.PngImagePlugin import PngInfo, PngImageFile
+from multiprocessing import Lock
 import json
 from PIL import Image
 
@@ -45,11 +47,28 @@ if mps and mps.is_available() and mps.is_built():
     torch.Tensor.__repr__ = lambda t: _orig(t.cpu()) # nightlies still slightly buggy...
 
 def file_drop_callback(window, paths, viewer):
+    # imgui.get_mouse_pose() sometimes returns -1...
+    posx = glfw.get_cursor_pos(window)[0] # relative to window top left
+    hovering_img = posx > viewer.toolbar_width
+    print('\nMouse position x:', posx)
+    print('Toolbar:', viewer.toolbar_width)
+    print('Hovering img:', hovering_img)
+    
     for p in paths:
         suff = Path(p).suffix.lower()
-        if suff == '.png':
-            meta = get_meta_from_img(p)
-            viewer.from_dict(meta)
+        if hovering_img:
+            # Hovering over image => load as UI state
+            if suff == '.png':
+                meta = get_meta_from_img(p)
+                viewer.from_dict(meta)
+            else:
+                print('Cannot load UI state from non-png images')
+        else:
+            # Hovering over settings bar => load as conditioning
+            if viewer.rend.model is None:
+                print('Model not loaded, please try again later')
+            else:
+                viewer.get_cond_from_img(p)
 
 def get_meta_from_img(path: str):
     state_dump = r'{}'
@@ -79,6 +98,11 @@ def seeds_to_samples(seeds, shape=(1, 512)):
     
     return torch.tensor(latents)
 
+# Imgui slider that can switch between int and float formatting at runtime
+def slider_dynamic(title, v, min, max):
+    scale_fmt = '%.2f' if np.modf(v)[0] > 0 else '%.0f' # dynamically change from ints to floats
+    return imgui.slider_float(title, v, min, max, format=scale_fmt)
+
 def download_weights():
     id = '1F8R6C_63mM49vjYRoaAgMTtHRrwX3YhZ' # sd-v1-4.ckpt
     trg = Path('models/ldm/stable-diffusion-v1/model.ckpt')
@@ -101,7 +125,7 @@ def download_weights():
     gdown.download(id=id, output=str(trg), quiet=False)
     assert trg.is_file(), 'DL failed!'
 
-def load_model_from_config(config, ckpt, use_half=False, verbose=True):
+def load_model_from_config(config, ckpt, use_half=False, verbose=False):
     print(f'Loading model from {ckpt}')
     pl_sd = torch.load(ckpt, map_location='cpu')
     sd = pl_sd['state_dict']
@@ -128,6 +152,9 @@ def load_model_from_config(config, ckpt, use_half=False, verbose=True):
     
     return model
 
+def get_act_shape(state):
+    return [state.C, state.H // state.f, state.W // state.f]
+
 @lru_cache()
 def get_model(pkl, use_half):
     config = OmegaConf.load('configs/stable-diffusion/v1-inference.yaml')
@@ -137,6 +164,7 @@ def get_model(pkl, use_half):
 class ModelViz(ToolbarViewer):    
     def __init__(self, name, batch_mode=False, hidden=False):
         self.batch_mode = batch_mode
+        self.state_lock = Lock()
         super().__init__(name, batch_mode=batch_mode, hidden=hidden)
 
     def setup_callbacks(self, window):
@@ -193,6 +221,8 @@ class ModelViz(ToolbarViewer):
         }
 
     def from_dict(self, state_dict_in):
+        self.state_lock.acquire()
+
         state_dict = state_dict_in['state']
         state_dict_soft = state_dict_in['state_soft']
         
@@ -207,6 +237,17 @@ class ModelViz(ToolbarViewer):
             setattr(self.state_soft, k, v)
 
         self.prompt_curr = self.state.prompt
+        
+        # If updating image conditioning: invalidate preview image
+        if 'image_cond' in state_dict:
+            self.rend.cond_img_handle = None
+
+        # Check that resolutions match
+        if self.state.image_cond and len(self.state.image_cond) != np.prod(get_act_shape(self.state)):
+            print('Image conditioning shape not compatible, removing...')
+            self.state.image_cond = None
+        
+        self.state_lock.release()
 
     def export_img(self):
         grid = reshape_grid(self.rend.intermed).contiguous() # HWC
@@ -225,18 +266,55 @@ class ModelViz(ToolbarViewer):
         
         print('Saved as', fname)
 
+    # Load image, get conditioning info
+    # Mutates state, results in recompute
+    def get_cond_from_img(self, pth):
+        image = Image.open(pth).convert("RGB")
+        w, h = image.size
+        w, h = map(lambda x: x - x % 32, (w, h)) # resize to integer multiple of 32
+        image = image.resize((w, h), resample=Image.LANCZOS)
+        np_img = np.array(image).astype(np.float32) / 255.0
+        np_img = np_img[None].transpose(0, 3, 1, 2)
+        init_image = 2 * torch.from_numpy(np_img).to(device) - 1
+
+        if self.state.fp16:
+            init_image = init_image.half()
+
+        init_latent = self.rend.model.get_first_stage_encoding(self.rend.model.encode_first_stage(init_image))  # [1, 4, H//f, W//f]
+        _, C, H_per_f, W_per_f = init_latent.shape
+        assert C == self.state.C, 'C does not match'
+        
+        # Make sure state is not corrupt
+        with self.state_lock:
+            self.state.sampler_type = 'ddim' # plms not supported?
+            self.state.H = H_per_f * self.state.f
+            self.state.W = W_per_f * self.state.f
+            
+            prev = self.state.image_cond
+            self.state.image_cond = init_latent.cpu().numpy().astype(np.float16).reshape(-1).tolist()
+            assert prev != self.state.image_cond, 'Using same list, shape might not match!'
+
+            # For faster hashing of state
+            self.state.image_cond_hash = hashlib.sha1(np_img.tobytes()).hexdigest()
+            print('Cond image hash:', self.state.image_cond_hash)
+
+        import random, string
+        handle = ''.join(random.choices(string.ascii_letters, k=20))
+        preview_img = image.resize((W_per_f, H_per_f), resample=Image.LANCZOS)
+        self.v.upload_image(handle, np.array(preview_img))
+        self.rend.cond_img_handle = handle
+
     # Progress bar below images
     def draw_output_extra(self):
         self.rend.i = imgui.slider_int('', self.rend.i, 0, self.rend.last_ui_state.T)[1]
 
     def compute(self):
         # Copy for this frame
-        s = deepcopy(self.state)
+        with self.state_lock:
+            s = deepcopy(self.state)
 
-        # Shapes
-        C = 4
-        f = 8
-        shape = [C, s.H // f, s.W // f] # [C, H/f, W/f]; f = ds, c = latent channels
+        # Shape of activations before SR network
+        shape = get_act_shape(s)
 
         # Perform computation
         # Detect changes
@@ -254,15 +332,22 @@ class ModelViz(ToolbarViewer):
 
         model = self.rend.model
 
-        def cache_key(s, i: int):
-            meta = asdict(s)
-            meta['seed'] += i
-            return json.dumps(meta)
+        # Remove list
+        bak = s.image_cond
+        s.image_cond = None
+        
+        # Compute hash of state
+        state_hash = hashlib.sha1(json.dumps(asdict(s)).encode('utf-8')).hexdigest()
+        def cache_key(i: int):
+            return state_hash + str(i)
+
+        # Restore state
+        s.image_cond = bak
 
         # Read from or write to cache
         finished = [False]*s.B
         for i, img in enumerate(self.rend.intermed):
-            key = cache_key(s, i)
+            key = cache_key(i)
             if key in self.rend.img_cache:
                 self.rend.intermed[i] = torch.tensor(self.rend.img_cache[key], device=device)
                 finished[i] = True
@@ -273,10 +358,6 @@ class ModelViz(ToolbarViewer):
             grid = reshape_grid(self.rend.intermed) # => HWC
             grid = grid if grid.device.type == 'cuda' else grid.cpu().numpy()
             return grid
-
-        # Initial noise
-        seeds = [s.seed + i for i in range(s.B)]
-        start_code = seeds_to_samples(seeds, (len(seeds), *shape)).to(device)
         
         class UserAbort(Exception):
             pass
@@ -307,21 +388,41 @@ class ModelViz(ToolbarViewer):
                         grid = grid if grid.device.type == 'cuda' else grid.cpu().numpy()
                         self.v.upload_image(self.output_key, grid)
                         self.img_shape = self.rend.intermed.shape[1:]
-
-                # Run image diffusion
-                self.rend.sampler.sample(S=s.T, conditioning=c, batch_size=s.B,
-                    shape=shape, verbose=False, unconditional_guidance_scale=s.guidance_scale,
-                    unconditional_conditioning=uc, eta=0.0, x_T=start_code, img_callback=cbk_img)
+                
+                # Initial noise
+                seeds = [s.seed + i for i in range(s.B)]
+                start_code = seeds_to_samples(seeds, (len(seeds), *shape)).to(device)
+                
+                if s.image_cond is not None:
+                    # Image conditioning
+                    arr = np.array(s.image_cond, dtype=np.float16).reshape([1, *shape])
+                    t = torch.tensor(arr, device=device).repeat_interleave(s.B, dim=0)
+                    t = t.half() if s.fp16 else t.float()
+                    assert self.state.sampler_type == 'ddim', 'Only ddim supported with image conditioning'
+                    strength = 1 - (s.image_cond_strength - 1) / 10 # [1, 10] => [0, 9] => [1.0, 0.1]
+                    t_enc = max(1, int(strength * s.T))
+                    self.rend.sampler.make_schedule(s.T, ddim_eta=0.0, verbose=False)
+                    z_enc = self.rend.sampler.stochastic_encode(t, torch.tensor([t_enc]*s.B).to(device), noise=start_code)
+                    self.rend.sampler.decode(z_enc, c, t_enc, unconditional_conditioning=uc, 
+                        unconditional_guidance_scale=s.guidance_scale, img_callback=cbk_img)
+                else:
+                    # Random initial noise
+                    self.rend.sampler.sample(S=s.T, conditioning=c, batch_size=s.B,
+                        shape=shape, verbose=False, unconditional_guidance_scale=s.guidance_scale,
+                        unconditional_conditioning=uc, eta=0.0, x_T=start_code, img_callback=cbk_img)
         except UserAbort:
             # UI state changed, restart rendering
             return None
 
         # Write to cache
         for i, img in enumerate(self.rend.intermed):
-            key = cache_key(s, i)
+            key = cache_key(i)
             if not (torch.any(torch.isnan(img)) or torch.all(img == 0)):
                 self.rend.img_cache[key] = img.cpu().numpy()
 
+        # Finished
+        self.rend.i = s.T
+        
         return None
     
     def draw_toolbar(self):
@@ -330,12 +431,11 @@ class ModelViz(ToolbarViewer):
         s = self.state
         s.B = imgui.input_int('B', s.B)[1]
         s.seed = max(0, imgui.input_int('Seed', s.seed, s.B, 1)[1])
-        s.T = imgui.input_int('T_img', s.T, 1, jmp_large)[1]
+        s.T = imgui.input_int('T', s.T, 1, jmp_large)[1]
         s.H = combo_box_vals('H', list(range(64, 2048, 64)), s.H, to_str=str)[1]
         s.W = combo_box_vals('W', list(range(64, 2048, 64)), s.W, to_str=str)[1]
-        scale_fmt = '%.2f' if np.modf(s.guidance_scale)[0] > 0 else '%.0f' # dynamically change from ints to floats
         s.sampler_type = combo_box_vals('Sampler', ['ddim', 'plms'], s.sampler_type)[1]
-        s.guidance_scale = imgui.slider_float('Guidance', s.guidance_scale, 0, 20, format=scale_fmt)[1]
+        s.guidance_scale = slider_dynamic('Guidance', s.guidance_scale, 0, 20)[1]
         self.state_soft.preview_interval = imgui.slider_int('Preview interval', self.state_soft.preview_interval, 0, 10)[1]
         self.prompt_curr = imgui.input_text_multiline('Prompt', self.prompt_curr, buffer_length=2048)[1]
         if imgui.button('Update'):
@@ -344,6 +444,19 @@ class ModelViz(ToolbarViewer):
         if imgui.button('Export image'):
             self.export_img()
 
+        # Conditioning img
+        if self.state.image_cond is not None:
+            imgui.text('Conditioning image:')
+            if self.rend.cond_img_handle is not None:
+                self.v.draw_image(self.rend.cond_img_handle, width=self.ui_scale*150)
+            else:
+                imgui.same_line()
+                imgui.text('no preview available')
+            s.image_cond_strength = slider_dynamic('Strength', s.image_cond_strength, 1, 10)[1]
+            if imgui.button('Remove'):
+                self.rend.cond_img_handle = None
+                s.image_cond_hash = None
+                s.image_cond = None
 
 # Volatile state: requires recomputation of results
 @dataclass
@@ -354,9 +467,14 @@ class UIState:
     B: int = 1
     H: int = 512
     W: int = 512
+    C: int = 4
+    f: int = 8
     fp16: int = False
     guidance_scale: float = 8.0 # classifier guidance
     sampler_type: str = 'ddim' # plms, ddim
+    image_cond: List[float] = None # from input image, fp16 as bytestr?, [B, 4, 64, 64], TODO: top-k SVD compression? (4*64*64 => 4*k*(2*64+1))
+    image_cond_strength: float = 7.0 # [0, 10]
+    image_cond_hash: str = None
     prompt: str = dedent('''
         東京, 吹雪, 夕方,
         National Geographic
@@ -373,6 +491,7 @@ class RendererState:
     model: LatentDiffusion = None
     sampler: Union[PLMSSampler, DDIMSampler] = None
     intermed: torch.Tensor = None
+    cond_img_handle: str = None # handle to GL texture of conditioning img
     img_cache: Dict[str, torch.Tensor] = None
     cond_cache: Dict[Tuple[str, float], Tuple[torch.Tensor, torch.Tensor]] = None
     i: int = 0 # current computation progress
