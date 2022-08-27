@@ -6,6 +6,8 @@
 # Features
 * Drag-and-drop reloading of UI state from exported images
 * Result caching to maximize responsiveness
+* Interactive preview
+* Prompt- and image conditioning
 
 # Setup
 
