@@ -6,8 +6,10 @@ import numpy as np
 import multiprocessing as mp
 from pathlib import Path
 from urllib.request import urlretrieve
+from threading import get_ident
 import os
 from sys import platform
+from contextlib import contextmanager
 
 import imgui.core
 from imgui.integrations.glfw import GlfwRenderer
@@ -249,6 +251,7 @@ class viewer:
         self._imgui_fonts = {size: imgui.get_io().fonts.add_font_from_file_ttf(font, size, imgui.get_io().fonts.get_glyph_ranges_chinese_full()) for size in font_sizes}
 
         self._context_lock = mp.Lock()
+        self._context_tid = None # id of thread in critical section
 
     def get_default_font(self):
         return str(Path(__file__).parent / 'MPLUSRounded1c-Medium.ttf')
@@ -261,19 +264,26 @@ class viewer:
         if has_pycuda:
             self._cuda_context.pop()
 
-    def _lock(self):
-        self._context_lock.acquire()
+    @contextmanager
+    def lock(self):
+        # Prevent double locks, e.g. when
+        # calling upload_image() from UI thread
+        tid = get_ident()
+        if self._context_tid == tid:
+            yield self._context_lock
+            return
+        
         try:
+            self._context_lock.acquire()
+            self._context_tid = tid
             glfw.make_context_current(self._window)
+            yield self._context_lock
         except Exception as e:
             print(str(e))
+        finally:
+            glfw.make_context_current(None)
+            self._context_tid = None
             self._context_lock.release()
-            return False
-        return True
-
-    def _unlock(self):
-        glfw.make_context_current(None)
-        self._context_lock.release()
 
     # Scales fonts and sliders/etc
     def set_ui_scale(self, scale):
@@ -385,9 +395,8 @@ class viewer:
 
         self.set_ui_scale(self.ui_scale)        
         
-        self._lock() # calls make_context_current()
-        impl = GlfwRenderer(self._window)
-        self._unlock()
+        with self.lock():
+            impl = GlfwRenderer(self._window)
         
         self._pressed_keys = set()
         self._hit_keys = set()
@@ -416,33 +425,34 @@ class viewer:
             if self.keyhit(glfw.KEY_ESCAPE):
                 glfw.set_window_should_close(self._window, 1)
 
-            self._lock() # calls make_context_current()
+            with self.lock():
             
-            # Breaks on MacOS. Needed?
-            #imgui.get_io().display_size = glfw.get_framebuffer_size(self._window)
-            
-            imgui.new_frame()
+                # Breaks on MacOS. Needed?
+                #imgui.get_io().display_size = glfw.get_framebuffer_size(self._window)
+                
+                imgui.new_frame()
 
-            # Tero viewer:
-            imgui.push_font(self._imgui_fonts[self._cur_font_size])
-            self.set_default_style(spacing=self.spacing, indent=self.font_size, scrollbar=self.font_size+4)
-    
-            loopfunc(self)
+                # Tero viewer:
+                imgui.push_font(self._imgui_fonts[self._cur_font_size])
+                self.set_default_style(spacing=self.spacing, indent=self.font_size, scrollbar=self.font_size+4)
+        
+                loopfunc(self)
 
-            for key in self._editables:
-                self._editables[key].loop(self)
+                for key in self._editables:
+                    self._editables[key].loop(self)
 
-            imgui.pop_font()
+                imgui.pop_font()
 
-            imgui.render()
-            
-            gl.glClearColor(0, 0, 0, 1)
-            gl.glClear(gl.GL_COLOR_BUFFER_BIT)
+                imgui.render()
+                
+                gl.glClearColor(0, 0, 0, 1)
+                gl.glClear(gl.GL_COLOR_BUFFER_BIT)
 
-            impl.render(imgui.get_draw_data())
-            glfw.swap_buffers(self._window)
-
-            self._unlock()
+                impl.render(imgui.get_draw_data())
+                
+                # TODO: compute thread has to wait until sync is done
+                # and lock is released if calling upload_image()?
+                glfw.swap_buffers(self._window)
         
         # Update size and pos
         if not self.fullscreen:
@@ -463,9 +473,8 @@ class viewer:
                     for line in lines:
                         file.write(line+'\n')
 
-        self._lock()
-        self.quit = True
-        self._unlock()
+        with self.lock():
+            self.quit = True
 
         for i in range(len(workers)):
             workers[i].join()
@@ -487,7 +496,7 @@ class viewer:
     # Upload image from PyTorch tensor
     def upload_image_torch(self, name, tensor):
         assert isinstance(tensor, torch.Tensor)
-        if self._lock():
+        with self.lock():
             cuda_synchronize()
             if not self.quit:
                 self.push_context() # set the context for whichever thread wants to upload
@@ -495,11 +504,10 @@ class viewer:
                     self._images[name] = _texture(self.tex_interp_mode)
                 self._images[name].upload_torch(tensor)
                 self.pop_context()
-            self._unlock()
     
     # Upload data from cuda pointer retrieved using custom TF op 
     def upload_image_TF_ptr(self, name, ptr, shape):
-        if self._lock():
+        with self.lock():
             cuda_synchronize()
             if not self.quit:
                 self.push_context() # set the context for whichever thread wants to upload
@@ -507,11 +515,10 @@ class viewer:
                     self._images[name] = _texture(self.tex_interp_mode)
                 self._images[name].upload_ptr(ptr, shape)
                 self.pop_context()
-            self._unlock()
 
     def upload_image_np(self, name, data):
         assert isinstance(data, np.ndarray)
-        if self._lock():
+        with self.lock():
             cuda_synchronize()
             if not self.quit:
                 self.push_context() # set the context for whichever thread wants to upload
@@ -519,4 +526,3 @@ class viewer:
                     self._images[name] = _texture(self.tex_interp_mode)
                 self._images[name].upload_np(data)
                 self.pop_context()
-            self._unlock()
