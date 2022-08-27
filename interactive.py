@@ -50,19 +50,12 @@ def file_drop_callback(window, paths, viewer):
     # imgui.get_mouse_pose() sometimes returns -1...
     posx = glfw.get_cursor_pos(window)[0] # relative to window top left
     hovering_img = posx > viewer.toolbar_width
-    print('\nMouse position x:', posx)
-    print('Toolbar:', viewer.toolbar_width)
-    print('Hovering img:', hovering_img)
     
     for p in paths:
         suff = Path(p).suffix.lower()
         if hovering_img:
             # Hovering over image => load as UI state
-            if suff == '.png':
-                meta = get_meta_from_img(p)
-                viewer.from_dict(meta)
-            else:
-                print('Cannot load UI state from non-png images')
+            viewer.load_state_from_img(p)
         else:
             # Hovering over settings bar => load as conditioning
             if viewer.rend.model is None:
@@ -170,10 +163,9 @@ def get_model(pkl, use_half):
     return model
 
 class ModelViz(ToolbarViewer):    
-    def __init__(self, name, batch_mode=False, hidden=False):
-        self.batch_mode = batch_mode
-        self.state_lock = Lock()
-        super().__init__(name, batch_mode=batch_mode, hidden=hidden)
+    def __init__(self, name, input=None):
+        self.input = input
+        super().__init__(name, batch_mode=False, hidden=False)
 
     def setup_callbacks(self, window):
         glfw.set_drop_callback(window,
@@ -191,6 +183,7 @@ class ModelViz(ToolbarViewer):
         self.state = UIState()
         self.state_soft = UIStateSoft()
         self.rend = RendererState()
+        self.state_lock = Lock()
         self.prompt_curr = self.state.prompt
 
         if device == 'cuda':
@@ -200,6 +193,9 @@ class ModelViz(ToolbarViewer):
         self.check_dataclass(self.state)
         self.check_dataclass(self.state_soft)
         self.check_dataclass(self.rend)
+
+        if self.input:
+            self.load_state_from_img(self.input)
 
     def init_sampler(self, model):
         stype = self.state.sampler_type
@@ -227,6 +223,15 @@ class ModelViz(ToolbarViewer):
             'state': asdict(self.state),
             'state_soft': asdict(self.state_soft),
         }
+
+    def load_state_from_img(self, path):
+        suff = Path(path).suffix
+        if suff != '.png':
+            print('Cannot load UI state from non-png files')
+            return
+        
+        meta = get_meta_from_img(path)
+        self.from_dict(meta)
 
     def from_dict(self, state_dict_in):
         self.state_lock.acquire()
@@ -521,7 +526,12 @@ def init_torch():
     torch.backends.cudnn.allow_tf32 = False
 
 if __name__ == '__main__':
+    import argparse
+    parser = argparse.ArgumentParser(description='Stable Diffusion visualizer')
+    parser.add_argument('input', type=str, nargs='?', default=None, help='Image to load state from')
+    args = parser.parse_args()
+    
     download_weights()
     init_torch()
-    viewer = ModelViz('sdui', hidden=False)
+    viewer = ModelViz('sdui', input=args.input)
     print('Done')
