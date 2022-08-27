@@ -11,6 +11,7 @@ from sys import platform
 
 import imgui.core
 from imgui.integrations.glfw import GlfwRenderer
+from imgui_themes import theme_dark_overshifted, theme_deep_dark, theme_ps, theme_contrast
 
 import glfw
 glfw.ERROR_REPORTING = 'raise' # make sure errors don't get swallowed
@@ -355,6 +356,13 @@ class viewer:
                 self.window_pos[0], posy, self._width, self._height, params.refresh_rate)
 
     def set_default_style(self, color_scheme='dark', spacing=9, indent=23, scrollbar=27):
+        #theme_custom()        
+        #theme_dark_overshifted()
+        #theme_ps()
+        theme_deep_dark()
+        #theme_contrast()
+        
+        # Overrides based on UI scale / font size
         s = imgui.get_style()
         s.window_padding        = [spacing, spacing]
         s.item_spacing          = [spacing, spacing]
@@ -362,19 +370,7 @@ class viewer:
         s.columns_min_spacing   = spacing
         s.indent_spacing        = indent
         s.scrollbar_size        = scrollbar
-        s.frame_padding         = [4, 3]
-        s.window_border_size    = 1
-        s.child_border_size     = 0
-        s.popup_border_size     = 0
-        s.frame_border_size     = 0
-        s.window_rounding       = 0
-        s.child_rounding        = 0
-        s.popup_rounding        = 0
-        s.frame_rounding        = 0
-        s.scrollbar_rounding    = 0
-        s.grab_rounding         = 0
 
-        getattr(imgui, f'style_colors_{color_scheme}')(s)
         c0 = s.colors[imgui.COLOR_MENUBAR_BACKGROUND]
         c1 = s.colors[imgui.COLOR_FRAME_BACKGROUND]
         s.colors[imgui.COLOR_POPUP_BACKGROUND] = [x * 0.7 + y * 0.3 for x, y in zip(c0, c1)][:3] + [1]
