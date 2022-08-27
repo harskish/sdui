@@ -30,7 +30,7 @@ from ldm.util import instantiate_from_config
 from ldm.models.diffusion.ddim import DDIMSampler
 from ldm.models.diffusion.plms import PLMSSampler
 from ldm.models.diffusion.ddpm import LatentDiffusion
-from viewer.single_image_viewer import draw as draw_debug
+#from viewer.single_image_viewer import draw as draw_debug
 
 # Suppress CLIP warning
 import transformers
@@ -61,7 +61,7 @@ def file_drop_callback(window, paths, viewer):
             if viewer.rend.model is None:
                 print('Model not loaded, please try again later')
             else:
-                viewer.get_cond_from_img(p)
+                viewer.get_cond_from_img(Image.open(p))
 
 def get_meta_from_img(path: str):
     state_dump = r'{}'
@@ -281,8 +281,8 @@ class ModelViz(ToolbarViewer):
 
     # Load image, get conditioning info
     # Mutates state, results in recompute
-    def get_cond_from_img(self, pth):
-        image = Image.open(pth).convert("RGB")
+    def get_cond_from_img(self, image: Image):
+        image = image.convert("RGB")
         w, h = image.size
         w, h = map(lambda x: x - x % 32, (w, h)) # resize to integer multiple of 32
         image = image.resize((w, h), resample=Image.LANCZOS)
@@ -317,9 +317,11 @@ class ModelViz(ToolbarViewer):
         self.v.upload_image(handle, np.array(preview_img))
         self.rend.cond_img_handle = handle
 
-    # Progress bar below images
-    def draw_output_extra(self):
-        self.rend.i = imgui.slider_int('', self.rend.i, 0, self.rend.last_ui_state.T)[1]
+    # Use current output as conditioning input
+    def load_cond_from_current(self):
+        out_np = reshape_grid(self.rend.intermed).cpu().numpy()
+        img = Image.fromarray(np.uint8(255*out_np))
+        self.get_cond_from_img(img)
 
     def compute(self):
         # Copy for this frame
@@ -444,6 +446,10 @@ class ModelViz(ToolbarViewer):
         
         return None
     
+    # Progress bar below images
+    def draw_output_extra(self):
+        self.rend.i = imgui.slider_int('', self.rend.i, 0, self.rend.last_ui_state.T)[1]
+
     def draw_toolbar(self):
         jmp_large = 100 if self.v.keydown(KEY_LEFT_SHIFT) else 10
 
@@ -460,12 +466,11 @@ class ModelViz(ToolbarViewer):
         if imgui.button('Update'):
             s.prompt = self.prompt_curr
 
-        if imgui.button('Export image'):
-            self.export_img()
-
-        # Conditioning img
-        if self.state.image_cond is not None:
-            imgui.text('Conditioning image:')
+        imgui.text('Conditioning image:')
+        if self.state.image_cond is None:
+            imgui.same_line()
+            imgui.text('None')
+        else:
             if self.rend.cond_img_handle is not None:
                 self.v.draw_image(self.rend.cond_img_handle, width=self.ui_scale*180)
             else:
@@ -476,6 +481,12 @@ class ModelViz(ToolbarViewer):
                 self.rend.cond_img_handle = None
                 s.image_cond_hash = None
                 s.image_cond = None
+            imgui.same_line()
+        if imgui.button('Use current'):
+            self.load_cond_from_current()
+
+        if imgui.button('Export image'):
+            self.export_img()
 
 # Volatile state: requires recomputation of results
 @dataclass
