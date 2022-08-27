@@ -98,6 +98,14 @@ def seeds_to_samples(seeds, shape=(1, 512)):
     
     return torch.tensor(latents)
 
+# Hash string into uint32
+@np.errstate(over='ignore')
+def djb2_hash(s: str):
+    hash = np.uint32(5381)
+    for c in s:
+        hash = np.uint32(33) * hash + np.uint32(ord(c))
+    return int(hash)
+
 # Imgui slider that can switch between int and float formatting at runtime
 def slider_dynamic(title, v, min, max):
     scale_fmt = '%.2f' if np.modf(v)[0] > 0 else '%.0f' # dynamically change from ints to floats
@@ -401,7 +409,8 @@ class ModelViz(ToolbarViewer):
 
                     # Image suffers if using same noise in encode and cond image generation
                     # => make sure sequences differ
-                    seeds = [(1<<32 - 1) - s.seed - i for i in range(s.B)] # reverse order starting at max seed
+                    base = djb2_hash(s.image_cond_hash) # hash loaded from state dump => deterministic
+                    seeds = [(base + s.seed + i) % (1<<32-1) for i in range(s.B)]
                     noises = seeds_to_samples(seeds, (len(seeds), *shape)).to(device)
                     z_enc = self.rend.sampler.stochastic_encode(t, torch.tensor([t_enc]*s.B).to(device), noise=noises)
                     self.rend.sampler.decode(z_enc, c, t_enc, unconditional_conditioning=uc, 
@@ -453,7 +462,7 @@ class ModelViz(ToolbarViewer):
         if self.state.image_cond is not None:
             imgui.text('Conditioning image:')
             if self.rend.cond_img_handle is not None:
-                self.v.draw_image(self.rend.cond_img_handle, width=self.ui_scale*150)
+                self.v.draw_image(self.rend.cond_img_handle, width=self.ui_scale*180)
             else:
                 imgui.same_line()
                 imgui.text('no preview available')
