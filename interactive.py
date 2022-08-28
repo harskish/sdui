@@ -36,6 +36,27 @@ from ldm.models.diffusion.ddpm import LatentDiffusion
 import transformers
 transformers.logging.set_verbosity_error()
 
+def apply_mps_patches():
+    from torch.nn.functional import gelu, group_norm
+    from ldm.modules.attention import GEGLU
+    from ldm.modules.diffusionmodules.util import GroupNorm32
+    
+    def forward(self, x):
+        # MPS: no float16 gelu
+        x, gate = self.proj(x).chunk(2, dim=-1)
+        return x * gelu(gate.float()).to(x.dtype)
+    GEGLU.forward = forward
+    
+    def forward(self, x):
+        # MPS: need explicit float cast on weight and bias
+        return group_norm(x.float(), self.num_groups,
+            self.weight.float(), self.bias.float(), self.eps).type(x.dtype)
+    GroupNorm32.forward = forward
+
+    # Nightlies still slightly buggy...
+    _orig = torch.Tensor.__repr__
+    torch.Tensor.__repr__ = lambda t: _orig(t.cpu())
+
 # Choose backend
 device = 'cpu'
 if torch.cuda.is_available():
@@ -43,8 +64,7 @@ if torch.cuda.is_available():
 mps = getattr(torch.backends, 'mps', None)
 if mps and mps.is_available() and mps.is_built():
     device = 'mps'
-    _orig = torch.Tensor.__repr__
-    torch.Tensor.__repr__ = lambda t: _orig(t.cpu()) # nightlies still slightly buggy...
+    apply_mps_patches()
 
 def file_drop_callback(window, paths, viewer):
     # imgui.get_mouse_pose() sometimes returns -1...
@@ -159,6 +179,12 @@ def get_act_shape(state):
 @lru_cache()
 def get_model(pkl, use_half):
     config = OmegaConf.load('configs/stable-diffusion/v1-inference.yaml')
+    
+    #print(config['model']['params']['first_stage_config'])
+    #print(config['model']['params']['unet_config'])
+    #print(config['model']['params']['cond_stage_config'])
+    config['model']['params']['unet_config']['params']['use_fp16'] = use_half
+    
     model = load_model_from_config(config, pkl, use_half)
     return model
 
@@ -184,12 +210,7 @@ class ModelViz(ToolbarViewer):
         self.state_soft = UIStateSoft()
         self.rend = RendererState()
         self.state_lock = Lock()
-        self.prompt_curr = self.state.prompt
-
-        if device == 'cuda':
-            print('Using half precision globally')
-            self.state.fp16 = True
-        
+        self.prompt_curr = self.state.prompt        
         self.check_dataclass(self.state)
         self.check_dataclass(self.state_soft)
         self.check_dataclass(self.rend)
@@ -293,7 +314,8 @@ class ModelViz(ToolbarViewer):
         if self.state.fp16:
             init_image = init_image.half()
 
-        init_latent = self.rend.model.get_first_stage_encoding(self.rend.model.encode_first_stage(init_image))  # [1, 4, H//f, W//f]
+        init_latent = self.rend.model.get_first_stage_encoding(
+            self.rend.model.encode_first_stage(init_image))  # [1, 4, H//f, W//f]
         _, C, H_per_f, W_per_f = init_latent.shape
         assert C == self.state.C, 'C does not match'
         
@@ -407,7 +429,7 @@ class ModelViz(ToolbarViewer):
                 if s.image_cond is not None:
                     # Image conditioning
                     arr = np.array(s.image_cond, dtype=np.float16).reshape([1, *shape])
-                    t = torch.tensor(arr, device=device).repeat_interleave(s.B, dim=0)
+                    t = torch.tensor(arr, device=device).repeat((s.B, 1, 1, 1))
                     t = t.half() if s.fp16 else t.float()
                     assert self.state.sampler_type == 'ddim', 'Only ddim supported with image conditioning'
                     strength = 1 - (s.image_cond_strength - 1) / 10 # [1, 10] => [0, 9] => [1.0, 0.1]
@@ -419,13 +441,15 @@ class ModelViz(ToolbarViewer):
                     base = djb2_hash(s.image_cond_hash) # hash loaded from state dump => deterministic
                     seeds = [(base + s.seed + i) % (1<<32-1) for i in range(s.B)]
                     noises = seeds_to_samples(seeds, (len(seeds), *shape)).to(device)
+                    noises = noises.half() if s.fp16 else noises
                     z_enc = self.rend.sampler.stochastic_encode(t, torch.tensor([t_enc]*s.B).to(device), noise=noises)
-                    self.rend.sampler.decode(z_enc, c, t_enc, unconditional_conditioning=uc, 
+                    self.rend.sampler.decode(z_enc.to(t.dtype), c, t_enc, unconditional_conditioning=uc, 
                         unconditional_guidance_scale=s.guidance_scale, img_callback=cbk_img)
                 else:
                     # Initial noise
                     seeds = [s.seed + i for i in range(s.B)]
                     start_code = seeds_to_samples(seeds, (len(seeds), *shape)).to(device)
+                    start_code = start_code.half() if s.fp16 else start_code
 
                     # Random initial noise
                     self.rend.sampler.sample(S=s.T, conditioning=c, batch_size=s.B,
@@ -499,7 +523,7 @@ class UIState:
     W: int = 512
     C: int = 4
     f: int = 8
-    fp16: int = False
+    fp16: int = True
     guidance_scale: float = 8.0 # classifier guidance
     sampler_type: str = 'ddim' # plms, ddim
     image_cond: List[float] = None # from input image, fp16 as bytestr?, [B, 4, 64, 64], TODO: top-k SVD compression? (4*64*64 => 4*k*(2*64+1))
