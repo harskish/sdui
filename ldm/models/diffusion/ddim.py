@@ -15,12 +15,7 @@ class DDIMSampler(object):
         self.model = model
         self.ddpm_num_timesteps = model.num_timesteps
         self.schedule = schedule
-        if(torch.cuda.is_available()):
-            self.device_available = "cuda"
-        elif(torch.backends.mps.is_available()):
-            self.device_available = "mps"
-        else:
-            self.device_available = "cpu"
+        self.device_available = model.device
 
     def register_buffer(self, name, attr):
         if type(attr) == torch.Tensor:

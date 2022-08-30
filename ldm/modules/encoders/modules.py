@@ -10,13 +10,13 @@ from ldm.modules.x_transformer import Encoder, TransformerWrapper  # TODO: can w
 
 
 def get_default_device_type():
+    mps = getattr(torch.backends, "mps", None)
     if torch.cuda.is_available():
         return "cuda"
-    elif torch.backends.mps.is_available():
+    elif mps and mps.is_available() and mps.is_built():
         return "mps"
     else:
         return "cpu"
-
 
 class AbstractEncoder(nn.Module):
     def __init__(self):

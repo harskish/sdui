@@ -24,47 +24,44 @@ import json
 from PIL import Image
 
 from omegaconf import OmegaConf
-from torch import autocast
-from contextlib import nullcontext
 from ldm.util import instantiate_from_config
 from ldm.models.diffusion.ddim import DDIMSampler
 from ldm.models.diffusion.plms import PLMSSampler
 from ldm.models.diffusion.ddpm import LatentDiffusion
+from ldm.modules.encoders.modules import get_default_device_type
 #from viewer.single_image_viewer import draw as draw_debug
+
+from torch import autocast
+from contextlib import nullcontext
 
 # Suppress CLIP warning
 import transformers
 transformers.logging.set_verbosity_error()
 
-def apply_mps_patches():
-    from torch.nn.functional import gelu, group_norm
+# Float16 patch
+from ldm.modules.diffusionmodules.util import GroupNorm32
+from torch.nn.functional import group_norm
+def forward(self, x):
+    return group_norm(x.float(), self.num_groups,
+        self.weight.float(), self.bias.float(), self.eps).type(x.dtype)
+GroupNorm32.forward = forward
+
+# Choose backend
+device = get_default_device_type()
+if device == 'mps':
+    from torch.nn.functional import gelu
     from ldm.modules.attention import GEGLU
-    from ldm.modules.diffusionmodules.util import GroupNorm32
     
     def forward(self, x):
         # MPS: no float16 gelu
         x, gate = self.proj(x).chunk(2, dim=-1)
         return x * gelu(gate.float()).to(x.dtype)
     GEGLU.forward = forward
-    
-    def forward(self, x):
-        # MPS: need explicit float cast on weight and bias
-        return group_norm(x.float(), self.num_groups,
-            self.weight.float(), self.bias.float(), self.eps).type(x.dtype)
-    GroupNorm32.forward = forward
 
     # Nightlies still slightly buggy...
     _orig = torch.Tensor.__repr__
     torch.Tensor.__repr__ = lambda t: _orig(t.cpu())
 
-# Choose backend
-device = 'cpu'
-if torch.cuda.is_available():
-    device = 'cuda'
-mps = getattr(torch.backends, 'mps', None)
-if mps and mps.is_available() and mps.is_built():
-    device = 'mps'
-    apply_mps_patches()
 
 def file_drop_callback(window, paths, viewer):
     # imgui.get_mouse_pose() sometimes returns -1...
@@ -186,6 +183,10 @@ def get_model(pkl, use_half):
     config['model']['params']['unet_config']['params']['use_fp16'] = use_half
     
     model = load_model_from_config(config, pkl, use_half)
+    
+    # Does not seem to support float16
+    model.cond_stage_model.float()
+
     return model
 
 class ModelViz(ToolbarViewer):    
@@ -193,6 +194,10 @@ class ModelViz(ToolbarViewer):
         self.input = input
         super().__init__(name, batch_mode=False, hidden=False)
 
+    @property
+    def dtype(self):
+        return torch.float16 if self.state.fp16 else torch.float32
+    
     def setup_callbacks(self, window):
         glfw.set_drop_callback(window,
             partial(file_drop_callback, viewer=self))
@@ -217,6 +222,9 @@ class ModelViz(ToolbarViewer):
 
         if self.input:
             self.load_state_from_img(self.input)
+
+        if device == 'cpu':
+            self.state.fp16 = False
 
     def init_sampler(self, model):
         stype = self.state.sampler_type
@@ -261,7 +269,7 @@ class ModelViz(ToolbarViewer):
         state_dict_soft = state_dict_in['state_soft']
         
         # Ignore certain values
-        ignores = []
+        ignores = ['fp16']
         state_dict = { k: v for k,v in state_dict.items() if k not in ignores }
     
         for k, v in state_dict.items():
@@ -309,13 +317,12 @@ class ModelViz(ToolbarViewer):
         image = image.resize((w, h), resample=Image.LANCZOS)
         np_img = np.array(image).astype(np.float32) / 255.0
         np_img = np_img[None].transpose(0, 3, 1, 2)
-        init_image = 2 * torch.from_numpy(np_img).to(device) - 1
+        init_image = 2 * torch.tensor(np_img).to(self.dtype).to(device) - 1
 
-        if self.state.fp16:
-            init_image = init_image.half()
-
-        init_latent = self.rend.model.get_first_stage_encoding(
-            self.rend.model.encode_first_stage(init_image))  # [1, 4, H//f, W//f]
+        # TODO: MPS results broken due to UI thread?
+        enc = self.rend.model.encode_first_stage(init_image)
+        init_latent = self.rend.model.get_first_stage_encoding(enc)  # [1, 4, H//f, W//f]
+        
         _, C, H_per_f, W_per_f = init_latent.shape
         assert C == self.state.C, 'C does not match'
         
@@ -400,61 +407,57 @@ class ModelViz(ToolbarViewer):
             pass
 
         try:
-            precision_scope = autocast if device != 'mps' else nullcontext
-            with precision_scope(device):
-                # Get conditioning
-                prompt = s.prompt.replace('\n', ' ')
-                cond_key = (prompt, s.guidance_scale)
-                if cond_key not in self.rend.cond_cache:
-                    uc = None if s.guidance_scale == 1.0 else model.get_learned_conditioning(s.B * [""])
-                    c = model.get_learned_conditioning(s.B * [prompt])
-                    self.rend.cond_cache[cond_key] = (uc, c)
-                uc, c = self.rend.cond_cache[cond_key]
+            # Get conditioning
+            prompt = s.prompt.replace('\n', ' ')
+            cond_key = (prompt, s.guidance_scale)
+            if cond_key not in self.rend.cond_cache:
+                uc = None if s.guidance_scale == 1.0 else model.get_learned_conditioning(s.B * [""]).to(self.dtype)
+                c = model.get_learned_conditioning(s.B * [prompt]).to(self.dtype)
+                self.rend.cond_cache[cond_key] = (uc, c)
+            uc, c = self.rend.cond_cache[cond_key]
 
-                def cbk_img(img_curr, i):
-                    self.rend.i = i + 1
-                    if s != self.state or glfw.window_should_close(self.v._window):
-                        raise UserAbort
-                    
-                    # Always show after last iter
-                    p = self.state_soft.preview_interval
-                    if self.rend.i >= s.T or (p > 0 and i % p == 0):
-                        x_samples_ddim = model.decode_first_stage(img_curr)
-                        self.rend.intermed = torch.clamp((x_samples_ddim + 1.0) / 2.0, min=0.0, max=1.0) # [1, 3, 512, 512]
-                        grid = reshape_grid(self.rend.intermed) # => HWC
-                        grid = grid if grid.device.type == 'cuda' else grid.cpu().numpy()
-                        self.v.upload_image(self.output_key, grid)
-                        self.img_shape = self.rend.intermed.shape[1:]
+            def cbk_img(img_curr, i):
+                self.rend.i = i + 1
+                if s != self.state or glfw.window_should_close(self.v._window):
+                    raise UserAbort
                 
-                if s.image_cond is not None:
-                    # Image conditioning
-                    arr = np.array(s.image_cond, dtype=np.float16).reshape([1, *shape])
-                    t = torch.tensor(arr, device=device).repeat((s.B, 1, 1, 1))
-                    t = t.half() if s.fp16 else t.float()
-                    assert self.state.sampler_type == 'ddim', 'Only ddim supported with image conditioning'
-                    strength = 1 - (s.image_cond_strength - 1) / 10 # [1, 10] => [0, 9] => [1.0, 0.1]
-                    t_enc = max(1, int(strength * s.T))
-                    self.rend.sampler.make_schedule(s.T, ddim_eta=0.0, verbose=False)
+                # Always show after last iter
+                p = self.state_soft.preview_interval
+                if self.rend.i >= s.T or (p > 0 and i % p == 0):
+                    x_samples_ddim = model.decode_first_stage(img_curr)
+                    self.rend.intermed = torch.clamp((x_samples_ddim + 1.0) / 2.0, min=0.0, max=1.0) # [1, 3, 512, 512]
+                    grid = reshape_grid(self.rend.intermed) # => HWC
+                    grid = grid if grid.device.type == 'cuda' else grid.cpu().numpy()
+                    self.v.upload_image(self.output_key, grid)
+                    self.img_shape = self.rend.intermed.shape[1:]
+            
+            if s.image_cond is not None:
+                # Image conditioning
+                arr = np.array(s.image_cond, dtype=np.float16).reshape([1, *shape])
+                t = torch.tensor(arr, device=device).repeat((s.B, 1, 1, 1)).to(self.dtype)
+                assert self.state.sampler_type == 'ddim', 'Only ddim supported with image conditioning'
+                strength = 1 - (s.image_cond_strength - 1) / 10 # [1, 10] => [0, 9] => [1.0, 0.1]
+                t_enc = max(2, int(strength * s.T)) # less than two breaks image
+                self.rend.sampler.make_schedule(s.T, ddim_eta=0.0, verbose=False)
 
-                    # Image suffers if using same noise in encode and cond image generation
-                    # => make sure sequences differ
-                    base = djb2_hash(s.image_cond_hash) # hash loaded from state dump => deterministic
-                    seeds = [(base + s.seed + i) % (1<<32-1) for i in range(s.B)]
-                    noises = seeds_to_samples(seeds, (len(seeds), *shape)).to(device)
-                    noises = noises.half() if s.fp16 else noises
-                    z_enc = self.rend.sampler.stochastic_encode(t, torch.tensor([t_enc]*s.B).to(device), noise=noises)
-                    self.rend.sampler.decode(z_enc.to(t.dtype), c, t_enc, unconditional_conditioning=uc, 
-                        unconditional_guidance_scale=s.guidance_scale, img_callback=cbk_img)
-                else:
-                    # Initial noise
-                    seeds = [s.seed + i for i in range(s.B)]
-                    start_code = seeds_to_samples(seeds, (len(seeds), *shape)).to(device)
-                    start_code = start_code.half() if s.fp16 else start_code
+                # Image suffers if using same noise in encode and cond image generation
+                # => make sure sequences differ
+                base = djb2_hash(s.image_cond_hash) # hash loaded from state dump => deterministic
+                seeds = [(base + s.seed + i) % (1<<32-1) for i in range(s.B)]
+                noises = seeds_to_samples(seeds, (len(seeds), *shape)).to(device).to(self.dtype)
+                z_enc = self.rend.sampler.stochastic_encode(t, torch.tensor([t_enc]*s.B).to(device), noise=noises)
+                self.rend.sampler.decode(z_enc.to(t.dtype), c, t_enc, unconditional_conditioning=uc, 
+                    unconditional_guidance_scale=s.guidance_scale, img_callback=cbk_img)
+            else:
+                # Initial noise
+                seeds = [s.seed + i for i in range(s.B)]
+                start_code = seeds_to_samples(seeds, (len(seeds), *shape)).to(device)
+                start_code = start_code.to(self.dtype)
 
-                    # Random initial noise
-                    self.rend.sampler.sample(S=s.T, conditioning=c, batch_size=s.B,
-                        shape=shape, verbose=False, unconditional_guidance_scale=s.guidance_scale,
-                        unconditional_conditioning=uc, eta=0.0, x_T=start_code, img_callback=cbk_img)
+                # Random initial noise
+                self.rend.sampler.sample(S=s.T, conditioning=c, batch_size=s.B,
+                    shape=shape, verbose=False, unconditional_guidance_scale=s.guidance_scale,
+                    unconditional_conditioning=uc, eta=0.0, x_T=start_code, img_callback=cbk_img)
         except UserAbort:
             # UI state changed, restart rendering
             return None
@@ -502,9 +505,10 @@ class ModelViz(ToolbarViewer):
                 imgui.text('no preview available')
             s.image_cond_strength = slider_dynamic('Strength', s.image_cond_strength, 1, 10)[1]
             if imgui.button('Remove'):
-                self.rend.cond_img_handle = None
-                s.image_cond_hash = None
-                s.image_cond = None
+                with self.state_lock:
+                    self.rend.cond_img_handle = None
+                    s.image_cond = None
+                    s.image_cond_hash = None
             imgui.same_line()
         if imgui.button('Use current'):
             self.load_cond_from_current()
@@ -523,7 +527,7 @@ class UIState:
     W: int = 512
     C: int = 4
     f: int = 8
-    fp16: int = True
+    fp16: bool = True
     guidance_scale: float = 8.0 # classifier guidance
     sampler_type: str = 'ddim' # plms, ddim
     image_cond: List[float] = None # from input image, fp16 as bytestr?, [B, 4, 64, 64], TODO: top-k SVD compression? (4*64*64 => 4*k*(2*64+1))
