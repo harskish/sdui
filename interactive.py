@@ -33,6 +33,7 @@ from ldm.models.diffusion.plms import PLMSSampler
 from ldm.models.diffusion.k_samplers import KDiffusionSampler
 from ldm.models.diffusion.ddpm import LatentDiffusion
 from ldm.modules.encoders.modules import get_default_device_type
+from ldm.modules.attention import BasicTransformerBlock
 #from viewer.single_image_viewer import draw as draw_debug
 
 SAMPLERS_IMG2IMG = ['ddim', 'k_dpm_2_a', 'k_dpm_2', 'k_euler_a', 'k_euler', 'k_heun', 'k_lms']
@@ -186,9 +187,19 @@ def get_model(pkl, use_half):
     #print(config['model']['params']['unet_config'])
     #print(config['model']['params']['cond_stage_config'])
     config['model']['params']['unet_config']['params']['use_fp16'] = use_half
+    config['model']['params']['unet_config']['params']['use_checkpoint'] = False
     
     model = load_model_from_config(config, pkl, use_half)
+    model.eval()
+
+    def remove_checkpointing(model):
+        if isinstance(model, BasicTransformerBlock):
+            model.checkpoint = False
+        for c in model.children():
+            remove_checkpointing(c)
     
+    remove_checkpointing(model)
+
     # Does not seem to support float16
     model.cond_stage_model.float()
 
@@ -254,6 +265,7 @@ class ModelViz(ToolbarViewer):
 
     def init_model(self, pkl) -> LatentDiffusion:
         model = get_model(pkl, self.state.fp16)
+        self.export_to_onnx(model)
 
         # Reset caches
         prev = self.rend.model
@@ -378,6 +390,37 @@ class ModelViz(ToolbarViewer):
         out_np = self.rend.intermed[0].cpu().numpy().transpose(1, 2, 0) # HWC
         img = Image.fromarray(np.uint8(255*out_np))
         self.get_cond_from_img(img)
+
+    def export_to_onnx(self, model):
+        dtype = { torch.float16: 'fp16', torch.float32: 'fp32' }[self.dtype]
+        fname = Path(f'ckpts/unet_{dtype}_{device}_{self.state.H}x{self.state.W}.onnx')
+        if fname.is_file():
+            print('Already exported, skipping')
+            return
+
+        inner = model.model.diffusion_model
+        inner.eval()
+        
+        for p in inner.parameters():
+            p.requires_grad_(False)
+
+        assert model.model.conditioning_key == 'crossattn'
+        x_in = torch.randn(2, *get_act_shape(self.state), device=device, dtype=self.dtype) # [2, 4, 64, 64]
+        t_in = torch.tensor([1, 1], device=device, dtype=torch.int64) # [2]
+        c_in = torch.randn((2, 77, 768), device=device, dtype=self.dtype) # [2, 77, 768]
+        ex_inputs = (x_in, t_in, c_in)
+        input_names = ['x', 't', 'c']
+        
+        print('Jitting')
+        fwd_fun = lambda x, t, context: inner.forward(x, t, context=context) # [(e_t_uncond, e_t), 4, 64, 64]
+        jitted = torch.jit.trace(fwd_fun, ex_inputs, check_trace=False)
+
+        print('Exporting')
+        makedirs(fname.parent, exist_ok=True)
+        torch.onnx.export(jitted, ex_inputs, fname, input_names=input_names,
+            output_names=['et_uc_c'], do_constant_folding=True, opset_version=12) # einsum
+        
+        print('Exported as', fname)
 
     def compute(self):
         # Copy for this frame

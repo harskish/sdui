@@ -4,4 +4,5 @@
 **/*.ckpt
 outputs/
 src/
+ckpts/
 .vscode/settings.json
