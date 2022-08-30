@@ -348,7 +348,7 @@ class ModelViz(ToolbarViewer):
 
     # Use current output as conditioning input
     def load_cond_from_current(self):
-        out_np = reshape_grid(self.rend.intermed).cpu().numpy()
+        out_np = self.rend.intermed[0].cpu().numpy().transpose(1, 2, 0) # HWC
         img = Image.fromarray(np.uint8(255*out_np))
         self.get_cond_from_img(img)
 
@@ -485,8 +485,13 @@ class ModelViz(ToolbarViewer):
         s.B = imgui.input_int('B', s.B)[1]
         s.seed = max(0, imgui.input_int('Seed', s.seed, s.B, 1)[1])
         s.T = imgui.input_int('T', s.T, 1, jmp_large)[1]
-        s.H = combo_box_vals('H', list(range(64, 2048, 64)), s.H, to_str=str)[1]
-        s.W = combo_box_vals('W', list(range(64, 2048, 64)), s.W, to_str=str)[1]
+        with self.state_lock:
+            s.H = combo_box_vals('H', list(range(64, 2048, 64)), s.H, to_str=str)[1]
+            s.W = combo_box_vals('W', list(range(64, 2048, 64)), s.W, to_str=str)[1]
+            if s.image_cond and len(s.image_cond) != np.prod(get_act_shape(s)):
+                print('Image conditioning shape not compatible, removing...')
+                s.image_cond = None
+
         s.sampler_type = combo_box_vals('Sampler', ['ddim', 'plms'], s.sampler_type)[1]
         s.guidance_scale = slider_dynamic('Guidance', s.guidance_scale, 0, 20)[1]
         self.state_soft.preview_interval = imgui.slider_int('Preview interval', self.state_soft.preview_interval, 0, 10)[1]
