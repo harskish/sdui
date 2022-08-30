@@ -317,7 +317,7 @@ class ModelViz(ToolbarViewer):
         image = image.resize((w, h), resample=Image.LANCZOS)
         np_img = np.array(image).astype(np.float32) / 255.0
         np_img = np_img[None].transpose(0, 3, 1, 2)
-        init_image = 2 * torch.tensor(np_img).to(self.dtype).to(device) - 1
+        init_image = 2 * torch.tensor(np_img.copy()).to(self.dtype).to(device) - 1
 
         # TODO: MPS results broken due to UI thread?
         enc = self.rend.model.encode_first_stage(init_image)
