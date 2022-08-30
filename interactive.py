@@ -411,10 +411,10 @@ class ModelViz(ToolbarViewer):
             prompt = s.prompt.replace('\n', ' ')
             cond_key = (prompt, s.guidance_scale)
             if cond_key not in self.rend.cond_cache:
-                uc = None if s.guidance_scale == 1.0 else model.get_learned_conditioning(s.B * [""]).to(self.dtype)
-                c = model.get_learned_conditioning(s.B * [prompt]).to(self.dtype)
+                uc = None if s.guidance_scale == 1.0 else model.get_learned_conditioning([""]).to(self.dtype)
+                c = model.get_learned_conditioning([prompt]).to(self.dtype)
                 self.rend.cond_cache[cond_key] = (uc, c)
-            uc, c = self.rend.cond_cache[cond_key]
+            uc, c = map(lambda v: v.repeat((s.B, 1, 1)), self.rend.cond_cache[cond_key])
 
             def cbk_img(img_curr, i):
                 self.rend.i = i + 1
@@ -429,7 +429,8 @@ class ModelViz(ToolbarViewer):
                     grid = reshape_grid(self.rend.intermed) # => HWC
                     grid = grid if grid.device.type == 'cuda' else grid.cpu().numpy()
                     self.v.upload_image(self.output_key, grid)
-                    self.img_shape = self.rend.intermed.shape[1:]
+                    H, W, C = grid.shape
+                    self.img_shape = (C, H, W)
             
             if s.image_cond is not None:
                 # Image conditioning
