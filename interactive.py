@@ -12,6 +12,7 @@ from viewer.utils import reshape_grid, combo_box_vals
 from typing import Dict, Tuple, Union, List
 from os import makedirs
 from dataclasses import asdict
+from base64 import b64encode, b64decode
 from pathlib import Path
 from glfw import KEY_LEFT_SHIFT
 import gdown
@@ -107,6 +108,19 @@ def seeds_to_samples(seeds, shape=(1, 512)):
         latents[i] = rng.standard_normal(shape[1:])
     
     return torch.tensor(latents)
+
+# FP16: float list ~6x larger than base64-encoded one when json-serialized
+def arr_to_b64(arr: np.ndarray):
+    arr = arr.astype(np.dtype(arr.dtype).newbyteorder('<')) # convert to little-endian
+    b64_str = b64encode(arr.reshape(-1).tobytes()).decode('ascii') # little-endian bytes to base64 str
+    return b64_str
+
+def b64_to_arr(s: str, dtype: np.dtype):
+    dtype = np.dtype(dtype).newbyteorder('<') # incoming data is little-endian
+    buffer = b64decode(s.encode('ascii'))
+    elems = len(buffer) // dtype.itemsize
+    recovered = np.ndarray(shape=elems, dtype=dtype, buffer=buffer)
+    return recovered.astype(dtype.newbyteorder('=')) # to native byte order
 
 # Hash string into uint32
 @np.errstate(over='ignore')
@@ -262,6 +276,16 @@ class ModelViz(ToolbarViewer):
         meta = get_meta_from_img(path)
         self.from_dict(meta)
 
+    def reshape_image_cond(self):
+        # Check that resolutions match
+        if self.state.image_cond:
+            # https://stackoverflow.com/a/31179482
+            n_bytes = (len(self.state.image_cond) * 3) // 4 - self.state.image_cond.count('=', -2)
+            n_elems_fp16 = n_bytes // 2
+            if n_elems_fp16 != np.prod(get_act_shape(self.state)):
+                print('Image conditioning shape not compatible, removing... (TODO: resize instead?)')
+                self.state.image_cond = None
+
     def from_dict(self, state_dict_in):
         self.state_lock.acquire()
 
@@ -279,15 +303,16 @@ class ModelViz(ToolbarViewer):
             setattr(self.state_soft, k, v)
 
         self.prompt_curr = self.state.prompt
+
+        # Convert old-style image-cond
+        if isinstance(self.state.image_cond, list):
+            self.state.image_cond = arr_to_b64(np.array(self.state.image_cond).astype(np.float16))
         
         # If updating image conditioning: invalidate preview image
         if 'image_cond' in state_dict:
             self.rend.cond_img_handle = None
 
-        # Check that resolutions match
-        if self.state.image_cond and len(self.state.image_cond) != np.prod(get_act_shape(self.state)):
-            print('Image conditioning shape not compatible, removing...')
-            self.state.image_cond = None
+        self.reshape_image_cond()
         
         self.state_lock.release()
 
@@ -331,10 +356,7 @@ class ModelViz(ToolbarViewer):
             self.state.sampler_type = 'ddim' # plms not supported?
             self.state.H = H_per_f * self.state.f
             self.state.W = W_per_f * self.state.f
-            
-            prev = self.state.image_cond
-            self.state.image_cond = init_latent.cpu().numpy().astype(np.float16).reshape(-1).tolist()
-            assert prev != self.state.image_cond, 'Using same list, shape might not match!'
+            self.state.image_cond = arr_to_b64(init_latent.cpu().numpy().astype(np.float16))
 
             # For faster hashing of state
             self.state.image_cond_hash = hashlib.sha1(np_img.tobytes()).hexdigest()
@@ -375,18 +397,11 @@ class ModelViz(ToolbarViewer):
             return None
 
         model = self.rend.model
-
-        # Remove list
-        bak = s.image_cond
-        s.image_cond = None
         
         # Compute hash of state
         state_hash = hashlib.sha1(json.dumps(asdict(s)).encode('utf-8')).hexdigest()
         def cache_key(i: int):
             return state_hash + str(i)
-
-        # Restore state
-        s.image_cond = bak
 
         # Read from or write to cache
         finished = [False]*s.B
@@ -434,7 +449,7 @@ class ModelViz(ToolbarViewer):
             
             if s.image_cond is not None:
                 # Image conditioning
-                arr = np.array(s.image_cond, dtype=np.float16).reshape([1, *shape])
+                arr = b64_to_arr(s.image_cond, np.float16).reshape([1, *shape])
                 t = torch.tensor(arr, device=device).repeat((s.B, 1, 1, 1)).to(self.dtype)
                 assert self.state.sampler_type == 'ddim', 'Only ddim supported with image conditioning'
                 strength = 1 - (s.image_cond_strength - 1) / 10 # [1, 10] => [0, 9] => [1.0, 0.1]
@@ -488,9 +503,7 @@ class ModelViz(ToolbarViewer):
         with self.state_lock:
             s.H = combo_box_vals('H', list(range(64, 2048, 64)), s.H, to_str=str)[1]
             s.W = combo_box_vals('W', list(range(64, 2048, 64)), s.W, to_str=str)[1]
-            if s.image_cond and len(s.image_cond) != np.prod(get_act_shape(s)):
-                print('Image conditioning shape not compatible, removing...')
-                s.image_cond = None
+            self.reshape_image_cond()
 
         s.sampler_type = combo_box_vals('Sampler', ['ddim', 'plms'], s.sampler_type)[1]
         s.guidance_scale = slider_dynamic('Guidance', s.guidance_scale, 0, 20)[1]
@@ -536,7 +549,7 @@ class UIState:
     fp16: bool = True
     guidance_scale: float = 8.0 # classifier guidance
     sampler_type: str = 'ddim' # plms, ddim
-    image_cond: List[float] = None # from input image, fp16 as bytestr?, [B, 4, 64, 64], TODO: top-k SVD compression? (4*64*64 => 4*k*(2*64+1))
+    image_cond: str = None
     image_cond_strength: float = 7.0 # [0, 10]
     image_cond_hash: str = None
     prompt: str = dedent('''
