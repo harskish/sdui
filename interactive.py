@@ -20,6 +20,7 @@ import glfw
 import hashlib
 from functools import partial
 from PIL.PngImagePlugin import PngInfo, PngImageFile
+from pytorch_lightning import seed_everything
 from multiprocessing import Lock
 import json
 from PIL import Image
@@ -28,12 +29,13 @@ from omegaconf import OmegaConf
 from ldm.util import instantiate_from_config
 from ldm.models.diffusion.ddim import DDIMSampler
 from ldm.models.diffusion.plms import PLMSSampler
+from ldm.models.diffusion.k_samplers import KDiffusionSampler
 from ldm.models.diffusion.ddpm import LatentDiffusion
 from ldm.modules.encoders.modules import get_default_device_type
 #from viewer.single_image_viewer import draw as draw_debug
 
-from torch import autocast
-from contextlib import nullcontext
+SAMPLERS_IMG2IMG = ['ddim', 'k_dpm_2_a', 'k_dpm_2', 'k_euler_a', 'k_euler', 'k_heun', 'k_lms']
+SAMPLERS_ALL = SAMPLERS_IMG2IMG + ['plms']
 
 # Suppress CLIP warning
 import transformers
@@ -246,6 +248,18 @@ class ModelViz(ToolbarViewer):
             return PLMSSampler(model)
         elif stype == 'ddim':
             return DDIMSampler(model)
+        elif stype == 'k_dpm_2_a':
+            return KDiffusionSampler(model, 'dpm_2_ancestral')
+        elif stype == 'k_dpm_2':
+            return KDiffusionSampler(model, 'dpm_2')
+        elif stype == 'k_euler_a':
+            return KDiffusionSampler(model, 'euler_ancestral')
+        elif stype == 'k_euler':
+            return KDiffusionSampler(model, 'euler')
+        elif stype == 'k_heun':
+            return KDiffusionSampler(model, 'heun')
+        elif stype == 'k_lms':
+            return KDiffusionSampler(model, 'lms')
         else:
             raise RuntimeError('Unknown sampler type')
 
@@ -322,7 +336,7 @@ class ModelViz(ToolbarViewer):
         metadata = json.dumps(self.to_dict, sort_keys=True)
         
         from datetime import datetime
-        fname = datetime.now().strftime(r'%d%m%Y_%H%M%S.png')
+        fname = datetime.now().strftime(r'%Y%m%d_%H%M%S.png')
         outdir = Path('./outputs')
         os.makedirs(outdir, exist_ok=True)
 
@@ -353,7 +367,9 @@ class ModelViz(ToolbarViewer):
         
         # Make sure state is not corrupt
         with self.state_lock:
-            self.state.sampler_type = 'ddim' # plms not supported?
+            # Not all samplers support img2img
+            if self.state.sampler_type not in SAMPLERS_IMG2IMG:
+                self.state.sampler_type = 'ddim'
             self.state.H = H_per_f * self.state.f
             self.state.W = W_per_f * self.state.f
             self.state.image_cond = arr_to_b64(init_latent.cpu().numpy().astype(np.float16))
@@ -448,29 +464,37 @@ class ModelViz(ToolbarViewer):
                     self.img_shape = (C, H, W)
             
             if s.image_cond is not None:
-                # Image conditioning
+                # img2img
                 arr = b64_to_arr(s.image_cond, np.float16).reshape([1, *shape])
                 t = torch.tensor(arr, device=device).repeat((s.B, 1, 1, 1)).to(self.dtype)
-                assert self.state.sampler_type == 'ddim', 'Only ddim supported with image conditioning'
                 strength = 1 - (s.image_cond_strength - 1) / 10 # [1, 10] => [0, 9] => [1.0, 0.1]
                 t_enc = max(2, int(strength * s.T)) # less than two breaks image
-                self.rend.sampler.make_schedule(s.T, ddim_eta=0.0, verbose=False)
 
                 # Image suffers if using same noise in encode and cond image generation
                 # => make sure sequences differ
+                # TODO: need to seed whole diffusion process, not just initial rand
                 base = djb2_hash(s.image_cond_hash) # hash loaded from state dump => deterministic
                 seeds = [(base + s.seed + i) % (1<<32-1) for i in range(s.B)]
                 noises = seeds_to_samples(seeds, (len(seeds), *shape)).to(device).to(self.dtype)
-                z_enc = self.rend.sampler.stochastic_encode(t, torch.tensor([t_enc]*s.B).to(device), noise=noises)
-                self.rend.sampler.decode(z_enc.to(t.dtype), c, t_enc, unconditional_conditioning=uc, 
-                    unconditional_guidance_scale=s.guidance_scale, img_callback=cbk_img)
+
+                # TODO: instead provide cross-platform randn_like to samplers as callback
+                seed_everything(s.seed)
+                if self.state.sampler_type == 'ddim':    
+                    self.rend.sampler.make_schedule(s.T, ddim_eta=0.0, verbose=False)
+                    z_enc = self.rend.sampler.stochastic_encode(t, torch.tensor([t_enc]*s.B).to(device), noise=noises)
+                    self.rend.sampler.decode(z_enc.to(t.dtype), c, t_enc, unconditional_conditioning=uc, 
+                        unconditional_guidance_scale=s.guidance_scale, img_callback=cbk_img)
+                else:
+                    self.rend.sampler.decode(t, c, noises, t_enc, s.T, unconditional_conditioning=uc,
+                        unconditional_guidance_scale=s.guidance_scale, img_callback=cbk_img)
             else:
-                # Initial noise
+                # txt2img
+                # TODO: need to seed whole diffusion process, not just initial rand
                 seeds = [s.seed + i for i in range(s.B)]
-                start_code = seeds_to_samples(seeds, (len(seeds), *shape)).to(device)
-                start_code = start_code.to(self.dtype)
+                start_code = seeds_to_samples(seeds, (len(seeds), *shape)).to(self.dtype).to(device)
 
                 # Random initial noise
+                seed_everything(s.seed)
                 self.rend.sampler.sample(S=s.T, conditioning=c, batch_size=s.B,
                     shape=shape, verbose=False, unconditional_guidance_scale=s.guidance_scale,
                     unconditional_conditioning=uc, eta=0.0, x_T=start_code, img_callback=cbk_img)
@@ -505,7 +529,7 @@ class ModelViz(ToolbarViewer):
             s.W = combo_box_vals('W', list(range(64, 2048, 64)), s.W, to_str=str)[1]
             self.reshape_image_cond()
 
-        s.sampler_type = combo_box_vals('Sampler', ['ddim', 'plms'], s.sampler_type)[1]
+        s.sampler_type = combo_box_vals('Sampler', SAMPLERS_ALL if s.image_cond is None else SAMPLERS_IMG2IMG, s.sampler_type)[1]
         s.guidance_scale = slider_dynamic('Guidance', s.guidance_scale, 0, 20)[1]
         self.state_soft.preview_interval = imgui.slider_int('Preview interval', self.state_soft.preview_interval, 0, 10)[1]
         self.prompt_curr = imgui.input_text_multiline('Prompt', self.prompt_curr, buffer_length=2048)[1]
@@ -548,7 +572,7 @@ class UIState:
     f: int = 8
     fp16: bool = True
     guidance_scale: float = 8.0 # classifier guidance
-    sampler_type: str = 'ddim' # plms, ddim
+    sampler_type: str = 'k_euler'
     image_cond: str = None
     image_cond_strength: float = 7.0 # [0, 10]
     image_cond_hash: str = None

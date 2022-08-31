@@ -219,7 +219,7 @@ class PLMSSampler(object):
             if noise_dropout > 0.:
                 noise = torch.nn.functional.dropout(noise, p=noise_dropout)
             x_prev = a_prev.sqrt() * pred_x0 + dir_xt + noise
-            return x_prev, pred_x0
+            return x_prev.to(e_t.dtype), pred_x0.to(e_t.dtype)
 
         e_t = get_model_output(x, t)
         if len(old_eps) == 0:
