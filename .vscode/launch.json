@@ -14,6 +14,15 @@
             "args": []
         },
         {
+            "name": "ONNX",
+            "type": "python",
+            "request": "launch",
+            "program": "${workspaceFolder}/onnx/run.py",
+            "console": "integratedTerminal",
+            "justMyCode": true,
+            "args": []
+        },
+        {
             "name": "Sample",
             "type": "python",
             "request": "launch",
