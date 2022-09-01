@@ -3,7 +3,8 @@ from pathlib import Path
 import sys
 
 kdiff_root = Path(__file__).parent / 'k-diffusion'
-assert kdiff_root.is_dir(), 'Submodules missing; please run "git submodule update --init --recursive"'
+assert kdiff_root.is_dir() and len(list(kdiff_root.glob('*'))), \
+    'Submodules missing; please run "git submodule update --init --recursive"'
 sys.path += [str(kdiff_root)]
 import k_diffusion as K # type: ignore
 
