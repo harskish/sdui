@@ -25,6 +25,7 @@ from multiprocessing import Lock
 import json
 from PIL import Image
 
+from mps_patches import apply_mps_patches
 from omegaconf import OmegaConf
 from ldm.util import instantiate_from_config
 from ldm.models.diffusion.ddim import DDIMSampler
@@ -52,19 +53,7 @@ GroupNorm32.forward = forward
 # Choose backend
 device = get_default_device_type()
 if device == 'mps':
-    from torch.nn.functional import gelu
-    from ldm.modules.attention import GEGLU
-    
-    def forward(self, x):
-        # MPS: no float16 gelu
-        x, gate = self.proj(x).chunk(2, dim=-1)
-        return x * gelu(gate.float()).to(x.dtype)
-    GEGLU.forward = forward
-
-    # Nightlies still slightly buggy...
-    _orig = torch.Tensor.__repr__
-    torch.Tensor.__repr__ = lambda t: _orig(t.cpu())
-
+    apply_mps_patches()
 
 def file_drop_callback(window, paths, viewer):
     # imgui.get_mouse_pose() sometimes returns -1...
