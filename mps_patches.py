@@ -27,6 +27,15 @@ def apply_mps_patches():
         return x * gelu(gate.float()).to(x.dtype)
     GEGLU.forward = forward
 
+    # arr[None] reshaping op broken
+    from k_diffusion import utils # type: ignore
+    def patched(x, target_dims):
+        dims_to_append = target_dims - x.ndim
+        if dims_to_append < 0:
+            raise ValueError(f'input has {x.ndim} dims but target_dims is {target_dims}, which is less')
+        return x.reshape(x.shape + (1,) * dims_to_append)
+    utils.append_dims = patched
+
     # Nightlies still slightly buggy...
     _orig = torch.Tensor.__repr__
     torch.Tensor.__repr__ = lambda t: _orig(t.cpu())
