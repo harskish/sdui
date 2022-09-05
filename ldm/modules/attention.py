@@ -149,6 +149,8 @@ class SpatialSelfAttention(nn.Module):
         return x+h_
 
 
+ATTN_GROUP_SIZE = 16
+
 class CrossAttention(nn.Module):
     def __init__(self, query_dim, context_dim=None, heads=8, dim_head=64, dropout=0.):
         super().__init__()
@@ -174,23 +176,28 @@ class CrossAttention(nn.Module):
         context = default(context, x)
         k = self.to_k(context)
         v = self.to_v(context)
+        del context, x
 
         q, k, v = map(lambda t: rearrange(t, 'b n (h d) -> (b h) n d', h=h), (q, k, v))
 
-        sim = einsum('b i d, b j d -> b i j', q, k) * self.scale
+        # https://github.com/basujindal/stable-diffusion/pull/117#issuecomment-1236387342
+        sz = ATTN_GROUP_SIZE
+        r1 = torch.zeros(q.shape[0], q.shape[1], v.shape[2], device=q.device, dtype=q.dtype)
+        for i in range(0, q.shape[0], sz):
+            end = i + sz
+            s1 = einsum('b i d, b j d -> b i j', q[i:end], k[i:end])
+            s1 *= self.scale
 
-        if exists(mask):
-            mask = rearrange(mask, 'b ... -> b (...)')
-            max_neg_value = -torch.finfo(sim.dtype).max
-            mask = repeat(mask, 'b j -> (b h) () j', h=h)
-            sim.masked_fill_(~mask, max_neg_value)
+            s2 = s1.softmax(dim=-1)
+            del s1
 
-        # attention, what we cannot get enough of
-        attn = sim.softmax(dim=-1)
+            r1[i:end] = einsum('b i j, b j d -> b i d', s2, v[i:end])
+            del s2
 
-        out = einsum('b i j, b j d -> b i d', attn, v)
-        out = rearrange(out, '(b h) n d -> b n (h d)', h=h)
-        return self.to_out(out)
+        r2 = rearrange(r1, '(b h) n d -> b n (h d)', h=h)
+        del r1
+
+        return self.to_out(r2)
 
 
 class BasicTransformerBlock(nn.Module):

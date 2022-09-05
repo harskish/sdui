@@ -1,6 +1,8 @@
 import os
-import imgui
+#os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'max_split_size_mb:128'
+
 import torch
+import imgui
 import numpy as np
 from textwrap import dedent
 from sys import exit
@@ -33,6 +35,7 @@ from ldm.models.diffusion.plms import PLMSSampler
 from ldm.models.diffusion.k_samplers import KDiffusionSampler
 from ldm.models.diffusion.ddpm import LatentDiffusion
 from ldm.modules.encoders.modules import get_default_device_type
+from ldm.modules import attention
 #from viewer.single_image_viewer import draw as draw_debug
 
 SAMPLERS_IMG2IMG = ['ddim', 'k_dpm_2_a', 'k_dpm_2', 'k_euler_a', 'k_euler', 'k_heun', 'k_lms']
@@ -231,6 +234,8 @@ class ModelViz(ToolbarViewer):
         if device == 'cpu':
             self.state.fp16 = False
 
+        self.post_init()
+
     def init_sampler(self, model):
         stype = self.state.sampler_type
         if stype == 'plms':
@@ -305,8 +310,6 @@ class ModelViz(ToolbarViewer):
         for k, v in state_dict_soft.items():
             setattr(self.state_soft, k, v)
 
-        self.prompt_curr = self.state.prompt
-
         # Convert old-style image-cond
         if isinstance(self.state.image_cond, list):
             self.state.image_cond = arr_to_b64(np.array(self.state.image_cond).astype(np.float16))
@@ -315,9 +318,15 @@ class ModelViz(ToolbarViewer):
         if 'image_cond' in state_dict:
             self.rend.cond_img_handle = None
 
-        self.reshape_image_cond()
+        self.post_init()
         
         self.state_lock.release()
+
+    # After init or state load
+    def post_init(self):
+        self.state.attn_group_size = attention.ATTN_GROUP_SIZE = min(attention.ATTN_GROUP_SIZE, self.state.attn_group_size)
+        self.reshape_image_cond()
+        self.prompt_curr = self.state.prompt
 
     def export_img(self):
         grid = reshape_grid(self.rend.intermed).contiguous() # HWC
@@ -395,7 +404,7 @@ class ModelViz(ToolbarViewer):
             self.rend.model = self.init_model(s.pkl)
             self.rend.sampler = self.init_sampler(self.rend.model)
             self.rend.i = 0
-            self.rend.intermed = torch.zeros(s.B, 3, s.H, s.W, device=device)
+            self.rend.intermed = torch.zeros(s.B, 3, s.H, s.W, device=device, dtype=self.dtype)
 
         # Check if work is done
         if self.rend.i >= s.T:
@@ -517,6 +526,14 @@ class ModelViz(ToolbarViewer):
             s.H = combo_box_vals('H', list(range(64, 2048, 64)), s.H, to_str=str)[1]
             s.W = combo_box_vals('W', list(range(64, 2048, 64)), s.W, to_str=str)[1]
             self.reshape_image_cond()
+        
+        # Speed-VRAM tradeoff, larger = faster
+        ch, s.attn_group_size = combo_box_vals('Attn. group size', [2, 4, 8, 16], s.attn_group_size)
+        if imgui.is_item_hovered():
+            imgui.set_tooltip('Attention group size, smaller values reduce VRAM requirement at the cost of speed')
+        if ch:
+            torch.cuda.empty_cache()
+            attention.ATTN_GROUP_SIZE = s.attn_group_size
 
         s.sampler_type = combo_box_vals('Sampler', SAMPLERS_ALL if s.image_cond is None else SAMPLERS_IMG2IMG, s.sampler_type)[1]
         s.guidance_scale = slider_dynamic('Guidance', s.guidance_scale, 0, 20)[1]
@@ -561,6 +578,7 @@ class UIState:
     f: int = 8
     fp16: bool = True
     guidance_scale: float = 8.0 # classifier guidance
+    attn_group_size: int = 16
     sampler_type: str = 'k_euler'
     image_cond: str = None
     image_cond_strength: float = 7.0 # [0, 10]
@@ -589,7 +607,7 @@ class RendererState:
 def init_torch():
     # Go fast
     torch.autograd.set_grad_enabled(False)
-    torch.backends.cudnn.benchmark = True
+    torch.backends.cudnn.benchmark = False
     
     # Stay safe
     os.environ['NVIDIA_TF32_OVERRIDE'] = '0'

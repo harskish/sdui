@@ -49,7 +49,7 @@ def rgetattr(obj, key, default=None):
     return getattr(head, key, default)
 
 # Combo box that returns value, not index
-def combo_box_vals(title, values, current, height_in_items=-1, to_str=lambda v: v):
+def combo_box_vals(title, values, current, height_in_items=-1, to_str=str):
     curr_idx = 0 if current not in values else values.index(current)
     changed, ind = imgui.combo(title, curr_idx, [to_str(v) for v in values], height_in_items)
     return changed, values[ind]
