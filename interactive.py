@@ -484,8 +484,9 @@ class ModelViz(ToolbarViewer):
                     self.rend.sampler.decode(z_enc.to(t.dtype), c, t_enc, unconditional_conditioning=uc, 
                         unconditional_guidance_scale=s.guidance_scale, img_callback=cbk_img)
                 else:
-                    self.rend.sampler.decode(t, c, noises, t_enc, s.T, unconditional_conditioning=uc,
+                    ret = self.rend.sampler.decode(t, c, noises, t_enc, s.T, unconditional_conditioning=uc,
                         unconditional_guidance_scale=s.guidance_scale, img_callback=cbk_img)
+                    cbk_img(ret, s.T - 1) # iteration exits early, show last image
             else:
                 # txt2img
                 # TODO: need to seed whole diffusion process, not just initial rand
