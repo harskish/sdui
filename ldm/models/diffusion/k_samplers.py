@@ -14,11 +14,14 @@ class CFGDenoiser(torch.nn.Module):
         self.inner_model = model
 
     def forward(self, x, sigma, uncond, cond, cond_scale):
-        x_in = torch.cat([x] * 2)
-        sigma_in = torch.cat([sigma] * 2)
-        cond_in = torch.cat([uncond, cond])
-        uncond, cond = self.inner_model(x_in, sigma_in, cond=cond_in).chunk(2)
-        return uncond + (cond - uncond) * cond_scale
+        if uncond is None or cond_scale == 1:
+            return self.inner_model(x, sigma, cond=cond)
+        else:
+            x_in = torch.cat([x] * 2)
+            sigma_in = torch.cat([sigma] * 2)
+            cond_in = torch.cat([uncond, cond])
+            uncond, cond = self.inner_model(x_in, sigma_in, cond=cond_in).chunk(2)
+            return uncond + (cond - uncond) * cond_scale
 
 class KDiffusionSampler:
     def __init__(self, m, sampler):

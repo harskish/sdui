@@ -444,7 +444,7 @@ class ModelViz(ToolbarViewer):
                 uc = None if s.guidance_scale == 1.0 else model.get_learned_conditioning([""]).to(self.dtype)
                 c = model.get_learned_conditioning([prompt]).to(self.dtype)
                 self.rend.cond_cache[cond_key] = (uc, c)
-            uc, c = map(lambda v: v.repeat((s.B, 1, 1)), self.rend.cond_cache[cond_key])
+            uc, c = map(lambda v: v.repeat((s.B, 1, 1)) if v is not None else v, self.rend.cond_cache[cond_key])
 
             def cbk_img(img_curr, i):
                 self.rend.i = i + 1
