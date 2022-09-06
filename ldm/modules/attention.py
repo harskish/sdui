@@ -194,6 +194,13 @@ class CrossAttention(nn.Module):
             r1[i:end] = einsum('b i j, b j d -> b i d', s2, v[i:end])
             del s2
 
+            if mask is not None:
+                raise NotImplementedError()
+                # mask = rearrange(mask, 'b ... -> b (...)')
+                # max_neg_value = -torch.finfo(sim.dtype).max
+                # mask = repeat(mask, 'b j -> (b h) () j', h=h)
+                # sim.masked_fill_(~mask, max_neg_value)
+
         r2 = rearrange(r1, '(b h) n d -> b n (h d)', h=h)
         del r1
 
