@@ -20,20 +20,6 @@ class ImgShape(ctypes.Structure):
 class WindowSize(ctypes.Structure):
     _fields_ = [('w', ctypes.c_uint), ('h', ctypes.c_uint)]
 
-# Single global instance
-# Removes need to pass variable around in code
-# Just call draw() (optionally call init first)
-inst = None
-
-def init(*args, **kwargs):
-    global inst
-    if inst is None:
-        inst = SingleImageViewer(*args, **kwargs)
-
-def draw(*args, **kwargs):
-    init('SIV') # no-op if init already performed
-    inst.draw(*args, **kwargs)
-
 class SingleImageViewer:
     def __init__(self, title, key=None, dtype='uint8', vsync=True, hidden=False):
         self.title = title
@@ -133,27 +119,55 @@ class SingleImageViewer:
             self.curr_window_size.h = h
 
     # Called from main thread
-    def draw(self, img_hwc, ignore_pause=False):
+    def draw(self, img_hwc=None, img_chw=None, ignore_pause=False):
         # Paused or closed
         if (self.paused.value and not ignore_pause) or not self.ui_process.is_alive():
             return
 
+        assert img_hwc is not None or img_chw is not None, 'Must provide img_hwc or img_chw'
+        assert img_hwc is None or img_chw is None, 'Cannot provide both img_hwc and img_chw'
+
         if torch.is_tensor(img_hwc):
             img_hwc = img_hwc.detach().cpu().numpy()
+
+        if torch.is_tensor(img_chw):
+            img_chw = img_chw.detach().cpu().numpy()
+
+        # Convert chw to hwc, if provided
+        if img_chw is not None:
+            img_hwc = np.transpose(img_chw, (1, 2, 0))
+            img_chw = None        
 
         sz = np.prod(img_hwc.shape)
         assert sz <= np.prod(self.max_size), f'Image too large, max size {self.max_size}'
         
-        target_type = np.uint8 if self.dtype == 'uint8' else np.float32
-        assert img_hwc.dtype == target_type, f'Expected {self.dtype}, got {img_hwc.dtype}'
+        # Valid ranges for RGB data
+        maxval = 1 if img_hwc.dtype.kind == 'f' else 255
+        minval = 0
+        
+        # If outside of range: normalize to [0, 1]
+        if img_hwc.max() > maxval or img_hwc.min() < minval:
+            img_hwc = img_hwc.astype(np.float32)
+            img_hwc -= img_hwc.min() # min is negative
+            img_hwc /= img_hwc.max()
+        
+        # Convert to target dtype
+        if self.dtype == 'uint8':
+            img_hwc = np.uint8(img_hwc * 255) if img_hwc.dtype.kind == 'f' else np.uint8(img_hwc)
+        else: 
+            img_hwc = img_hwc.astype(np.float32) / maxval
 
+        # (H, W) to (H, W, 1)
         if img_hwc.ndim == 2:
             img_hwc = np.expand_dims(img_hwc, -1)
+
+        # Use at most 3 channels
+        img_hwc = img_hwc[:, :, :3]
 
         # Synchronize
         with self.shared_buffer.get_lock():
             arr_np = np.frombuffer(self.shared_buffer.get_obj(), dtype=self.dtype)
-            arr_np[:sz] = np.clip(img_hwc, 0, 255).reshape(-1)
+            arr_np[:sz] = img_hwc.reshape(-1)
             self.latest_shape.h = img_hwc.shape[0]
             self.latest_shape.w = img_hwc.shape[1]
             self.latest_shape.c = img_hwc.shape[2]
@@ -210,3 +224,17 @@ class SingleImageViewer:
                 time.sleep(1/10) # paused
             else:
                 time.sleep(1/80) # idle
+
+# Single global instance
+# Removes need to pass variable around in code
+# Just call draw() (optionally call init first)
+inst: SingleImageViewer = None
+
+def init(*args, **kwargs):
+    global inst
+    if inst is None:
+        inst = SingleImageViewer(*args, **kwargs)
+
+def draw(img_hwc=None, img_chw=None, ignore_pause=False):
+    init('SIV') # no-op if init already performed
+    inst.draw(img_hwc, img_chw, ignore_pause)

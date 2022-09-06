@@ -1,3 +1,0 @@
-[submodule "ldm/models/diffusion/k-diffusion"]
-	path = ldm/models/diffusion/k-diffusion
-	url = https://github.com/crowsonkb/k-diffusion.git

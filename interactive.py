@@ -14,9 +14,11 @@ from viewer.utils import reshape_grid, combo_box_vals
 from typing import Dict, Tuple, Union, List
 from os import makedirs
 from dataclasses import asdict
+from contextlib import nullcontext
 from base64 import b64encode, b64decode
 from pathlib import Path
 from glfw import KEY_LEFT_SHIFT
+from torch.nn.functional import conv2d
 import gdown
 import glfw
 import hashlib
@@ -36,10 +38,10 @@ from ldm.models.diffusion.k_samplers import KDiffusionSampler
 from ldm.models.diffusion.ddpm import LatentDiffusion
 from ldm.modules.encoders.modules import get_default_device_type
 from ldm.modules import attention
-#from viewer.single_image_viewer import draw as draw_debug
+from viewer.single_image_viewer import draw as draw_debug
 
-SAMPLERS_IMG2IMG = ['ddim', 'k_dpm_2_a', 'k_dpm_2', 'k_euler_a', 'k_euler', 'k_heun', 'k_lms']
-SAMPLERS_ALL = SAMPLERS_IMG2IMG + ['plms']
+SAMPLERS_IMG2IMG = ['k_dpm_2_a', 'k_dpm_2', 'k_euler_a', 'k_euler', 'k_heun', 'k_lms']
+SAMPLERS_ALL = SAMPLERS_IMG2IMG + ['ddim', 'plms']
 
 # Suppress CLIP warning
 import transformers
@@ -72,7 +74,9 @@ def file_drop_callback(window, paths, viewer):
             if viewer.rend.model is None:
                 print('Model not loaded, please try again later')
             else:
-                viewer.get_cond_from_img(Image.open(p))
+                img = Image.open(p)
+                viewer.rend.cond_img_orig = img
+                viewer.get_cond_from_img(img, viewer.state.image_cond_scale_mode)
 
 def get_meta_from_img(path: str):
     state_dump = r'{}'
@@ -283,15 +287,21 @@ class ModelViz(ToolbarViewer):
         meta = get_meta_from_img(path)
         self.from_dict(meta)
 
-    def reshape_image_cond(self):
-        # Check that resolutions match
-        if self.state.image_cond:
+    def reshape_image_cond(self, need_lock=True):
+        if self.state.image_cond is None:
+            return
+        
+        # Original not available, cannot rescale
+        if self.rend.cond_img_orig is None:
             # https://stackoverflow.com/a/31179482
             n_bytes = (len(self.state.image_cond) * 3) // 4 - self.state.image_cond.count('=', -2)
             n_elems_fp16 = n_bytes // 2
             if n_elems_fp16 != np.prod(get_act_shape(self.state)):
-                print('Image conditioning shape not compatible, removing... (TODO: resize instead?)')
+                print('Image conditioning shape not compatible, removing...')
                 self.state.image_cond = None
+        else:
+            # Adapt image to current shape
+            self.get_cond_from_img(self.rend.cond_img_orig, self.state.image_cond_scale_mode, need_lock=need_lock)
 
     def from_dict(self, state_dict_in):
         self.state_lock.acquire()
@@ -348,24 +358,95 @@ class ModelViz(ToolbarViewer):
 
     # Load image, get conditioning info
     # Mutates state, results in recompute
-    def get_cond_from_img(self, image: Image):
-        image = image.convert("RGB")
+    # Scale modes:
+    # - stretch: ignore aspect ratio, resample
+    # - center: unscaled masked outpaint on mag, center-crop on min
+    # - fit: resize keeping AR, then masked outpaint
+    def get_cond_from_img(self, image_in: Image, scale_mode: str, need_lock=True):
+        image = image_in.copy().convert('RGB')
+        W, H = self.state.W, self.state.H
         w, h = image.size
-        w, h = map(lambda x: x - x % 32, (w, h)) # resize to integer multiple of 32
-        image = image.resize((w, h), resample=Image.LANCZOS)
-        np_img = np.array(image).astype(np.float32) / 255.0
+
+        canvas = Image.new(image.mode, (W, H), (0, 0, 0))
+
+        if (W, H) == (w, h):
+            pass # no processing needed
+        elif scale_mode == 'center':
+            pass # no processing needed
+        elif scale_mode == 'fit':
+            scale = min(H / h, W / w) # smaller scale along either dim
+            image = image.resize((int(round(w*scale)), int(round(h*scale))), resample=Image.Resampling.LANCZOS)
+        elif scale_mode == 'stretch':
+            image = image.resize((W, H), resample=Image.Resampling.LANCZOS)
+        else:
+            raise ValueError(f'Unknown scaling mode {scale_mode}')
+
+        # Paste centered
+        w, h = image.size # potentially changed
+        top_left = ((W - w) // 2, (H - h) // 2)
+        canvas.paste(image, top_left)
+
+        np_img = np.array(canvas).astype(np.float32) / 255.0
         np_img = np_img[None].transpose(0, 3, 1, 2)
         init_image = 2 * torch.tensor(np_img.copy()).to(self.dtype).to(device) - 1
 
-        # TODO: MPS results broken due to UI thread?
-        enc = self.rend.model.encode_first_stage(init_image)
-        init_latent = self.rend.model.get_first_stage_encoding(enc)  # [1, 4, H//f, W//f]
+        # Encoder produces (mean, logvar) that parametrize diagonal gaussian, which is sampled
+        # Smaller output => ill-posed, need distribution
+        encoded = self.rend.model.encode_first_stage(init_image)
+        encoded.std *= 0 # use mean directly, no variance
+        init_latent = self.rend.model.get_first_stage_encoding(encoded)  # computes (mean + std * randn(...))*scale_factor
         
         _, C, H_per_f, W_per_f = init_latent.shape
         assert C == self.state.C, 'C does not match'
+
+        # Set mask if needed
+        if w < W or h < H:
+            lef_x, top_y = top_left
+            rig_x, bot_y = (lef_x + w, top_y + h)
+            
+            blur_R = 1
+            mask = torch.ones((1, 1, H_per_f, W_per_f), device=device, dtype=self.dtype)
+
+            # Conservative valid image ranges
+            lef_x = int(np.ceil(lef_x / self.state.f))
+            rig_x = int(np.floor(rig_x / self.state.f))
+            top_y = int(np.ceil(top_y / self.state.f))
+            bot_y = int(np.floor(bot_y / self.state.f))
+
+            # Even more conservative (need to account for blur radius)
+            top_y = top_y + blur_R if top_y > 0 else top_y
+            lef_x = lef_x + blur_R if lef_x > 0 else lef_x
+            bot_y = bot_y - blur_R if bot_y < H_per_f else bot_y
+            rig_x = rig_x - blur_R if rig_x < W_per_f else rig_x
+            mask[:, :, top_y:bot_y, lef_x:rig_x] = 0
+
+            draw_debug(img_chw=mask[0])
+            
+            # Blur mask to reduce sharp transition
+            if blur_R > 0:    
+                gauss_kernel = torch.tensor([
+                    [1, 2, 1],
+                    [2, 4, 2],
+                    [1, 2, 1],
+                ], dtype=mask.dtype, device=mask.device).view(1, 1, 3, 3)
+                gauss_kernel /= gauss_kernel.sum()
+                assert blur_R == 1, 'Not implemented'
+                conv = torch.nn.Conv2d(3, 3, 3, paddimg=1, padding_mode='border')
+                conv.weight = gauss_kernel # [out_ch, in_ch/groups, kernel_size[0], kernel_size[1]]
+                raise RuntimeError('FIX')
+                #mask = conv(mask, gauss_kernel, padding=1).clip(0, 1)
+                draw_debug(img_chw=mask[0])
+            
+            self.rend.cond_img_mask = mask
+
+            # Use random init for outside parts
+            # Not needed? This is the final latent which is noised anyway later
+            #init_latent = mask * init_latent + (1 - mask) * torch.randn_like(init_latent) * encoded.std * self.rend.model.scale_factor
+        else:
+            self.rend.cond_img_mask = None
         
-        # Make sure state is not corrupt
-        with self.state_lock:
+        # Make sure state consistent
+        with (self.state_lock if need_lock else nullcontext()):
             # Not all samplers support img2img
             if self.state.sampler_type not in SAMPLERS_IMG2IMG:
                 self.state.sampler_type = 'ddim'
@@ -378,16 +459,16 @@ class ModelViz(ToolbarViewer):
             print('Cond image hash:', self.state.image_cond_hash)
 
         import random, string
-        handle = ''.join(random.choices(string.ascii_letters, k=20))
-        preview_img = image.resize((W_per_f, H_per_f), resample=Image.LANCZOS)
-        self.v.upload_image(handle, np.array(preview_img))
+        handle = self.rend.cond_img_handle or ''.join(random.choices(string.ascii_letters, k=20))
+        self.v.upload_image(handle, np.array(canvas)) # full res image shown
         self.rend.cond_img_handle = handle
 
     # Use current output as conditioning input
     def load_cond_from_current(self):
         out_np = self.rend.intermed[0].cpu().numpy().transpose(1, 2, 0) # HWC
         img = Image.fromarray(np.uint8(255*out_np))
-        self.get_cond_from_img(img)
+        self.rend.cond_img_orig = img
+        self.get_cond_from_img(img, self.state.image_cond_scale_mode)
 
     def compute(self):
         # Copy for this frame
@@ -426,7 +507,7 @@ class ModelViz(ToolbarViewer):
                 self.rend.intermed[i] = torch.tensor(self.rend.img_cache[key], device=device)
                 finished[i] = True
         
-        # No need to compute?
+        # No need to compute?  
         if all(finished):
             self.rend.i = s.T
             grid = reshape_grid(self.rend.intermed) # => HWC
@@ -462,42 +543,46 @@ class ModelViz(ToolbarViewer):
                     H, W, C = grid.shape
                     self.img_shape = (C, H, W)
             
-            if s.image_cond is not None:
-                # img2img
-                arr = b64_to_arr(s.image_cond, np.float16).reshape([1, *shape])
-                t = torch.tensor(arr, device=device).repeat((s.B, 1, 1, 1)).to(self.dtype)
-                strength = 1 - (s.image_cond_strength - 1) / 10 # [1, 10] => [0, 9] => [1.0, 0.1]
-                t_enc = max(2, int(strength * s.T)) # less than two breaks image
+            # TODO: need to seed whole diffusion process, not just initial rand
+            seeds = [s.seed + i for i in range(s.B)]
+            xT = seeds_to_samples(seeds, (len(seeds), *shape)).to(self.dtype).to(device)
 
+            t_img2img = 0
+            x0 = None
+            if s.image_cond is not None:
+                x0_np = b64_to_arr(s.image_cond, np.float16).reshape([1, *shape])
+                x0 = torch.tensor(x0_np, device=device).repeat((s.B, 1, 1, 1)).to(self.dtype)
+                strength = 1 - (s.image_cond_strength - 1) / 10 # [1, 10] => [0, 9] => [1.0, 0.1]
+                t_img2img = int(strength * s.T)
+                
                 # Image suffers if using same noise in encode and cond image generation
                 # => make sure sequences differ
                 # TODO: need to seed whole diffusion process, not just initial rand
                 base = djb2_hash(s.image_cond_hash) # hash loaded from state dump => deterministic
                 seeds = [(base + s.seed + i) % (1<<32-1) for i in range(s.B)]
-                noises = seeds_to_samples(seeds, (len(seeds), *shape)).to(device).to(self.dtype)
+                xT = seeds_to_samples(seeds, (len(seeds), *shape)).to(device).to(self.dtype)
+            
+            seed_everything(s.seed)
 
-                # TODO: instead provide cross-platform randn_like to samplers as callback
-                seed_everything(s.seed)
-                if self.state.sampler_type == 'ddim':    
-                    self.rend.sampler.make_schedule(s.T, ddim_eta=0.0, verbose=False)
-                    z_enc = self.rend.sampler.stochastic_encode(t, torch.tensor([t_enc]*s.B).to(device), noise=noises)
-                    self.rend.sampler.decode(z_enc.to(t.dtype), c, t_enc, unconditional_conditioning=uc, 
-                        unconditional_guidance_scale=s.guidance_scale, img_callback=cbk_img)
-                else:
-                    ret = self.rend.sampler.decode(t, c, noises, t_enc, s.T, unconditional_conditioning=uc,
-                        unconditional_guidance_scale=s.guidance_scale, img_callback=cbk_img)
-                    cbk_img(ret, s.T - 1) # iteration exits early, show last image
-            else:
-                # txt2img
-                # TODO: need to seed whole diffusion process, not just initial rand
-                seeds = [s.seed + i for i in range(s.B)]
-                start_code = seeds_to_samples(seeds, (len(seeds), *shape)).to(self.dtype).to(device)
-
-                # Random initial noise
-                seed_everything(s.seed)
+            if self.state.sampler_type not in SAMPLERS_IMG2IMG:
+                # txt2img on ddim/plms
                 self.rend.sampler.sample(S=s.T, conditioning=c, batch_size=s.B,
                     shape=shape, verbose=False, unconditional_guidance_scale=s.guidance_scale,
-                    unconditional_conditioning=uc, eta=0.0, x_T=start_code, img_callback=cbk_img)
+                    unconditional_conditioning=uc, eta=0.0, x_T=xT, img_callback=cbk_img)
+            else:
+                # txt2img, img2img or mixed, k-samplers
+                out, _ = self.rend.sampler.sample_general(
+                    steps_tot=s.T,
+                    steps_img2img=t_img2img,
+                    c=c,
+                    guidance_scale=s.guidance_scale,
+                    uc=uc,
+                    x_T=xT,
+                    x0=x0,
+                    mask=self.rend.cond_img_mask,
+                    img_callback=cbk_img
+                )
+                cbk_img(out, s.T - 1)
         except UserAbort:
             # UI state changed, restart rendering
             return None
@@ -524,10 +609,14 @@ class ModelViz(ToolbarViewer):
         s.B = imgui.input_int('B', s.B)[1]
         s.seed = max(0, imgui.input_int('Seed', s.seed, s.B, 1)[1])
         s.T = imgui.input_int('T', s.T, 1, jmp_large)[1]
+        
+        #self.state_lock.acquire()
         with self.state_lock:
-            s.H = combo_box_vals('H', list(range(64, 2048, 64)), s.H, to_str=str)[1]
-            s.W = combo_box_vals('W', list(range(64, 2048, 64)), s.W, to_str=str)[1]
-            self.reshape_image_cond()
+            chH, s.H = combo_box_vals('H', list(range(64, 2048, 64)), s.H, to_str=str)
+            chW, s.W = combo_box_vals('W', list(range(64, 2048, 64)), s.W, to_str=str)
+            if chH or chW:
+                self.reshape_image_cond(need_lock=False) # context manager lock released upon function call?
+        #self.state_lock.release()
         
         # Speed-VRAM tradeoff, larger = faster
         ch, self.state_soft.attn_group_size = combo_box_vals('Attn. group size', [2, 4, 8, 16], self.state_soft.attn_group_size)
@@ -551,6 +640,9 @@ class ModelViz(ToolbarViewer):
         else:
             if self.rend.cond_img_handle is not None:
                 self.v.draw_image(self.rend.cond_img_handle, width=self.ui_scale*180)
+                ch, s.image_cond_scale_mode = combo_box_vals('Scale mode', ['fit', 'center', 'stretch'], s.image_cond_scale_mode)
+                if ch:
+                    self.reshape_image_cond()
             else:
                 imgui.same_line()
                 imgui.text('no preview available')
@@ -558,6 +650,8 @@ class ModelViz(ToolbarViewer):
             if imgui.button('Remove'):
                 with self.state_lock:
                     self.rend.cond_img_handle = None
+                    self.rend.cond_img_orig = None
+                    self.rend.cond_img_mask = None
                     s.image_cond = None
                     s.image_cond_hash = None
             imgui.same_line()
@@ -584,6 +678,7 @@ class UIState:
     image_cond: str = None
     image_cond_strength: float = 7.0 # [0, 10]
     image_cond_hash: str = None
+    image_cond_scale_mode: str = 'fit' # center, stretch
     prompt: str = dedent('''
         東京, 吹雪, 夕方,
         National Geographic
@@ -602,6 +697,8 @@ class RendererState:
     sampler: Union[PLMSSampler, DDIMSampler] = None
     intermed: torch.Tensor = None
     cond_img_handle: str = None # handle to GL texture of conditioning img
+    cond_img_orig: Image = None # original conditioning image
+    cond_img_mask: torch.Tensor = None
     img_cache: Dict[str, torch.Tensor] = None
     cond_cache: Dict[Tuple[str, float], Tuple[torch.Tensor, torch.Tensor]] = None
     i: int = 0 # current computation progress
