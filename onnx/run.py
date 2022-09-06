@@ -1,5 +1,78 @@
 import os
 
+# Selective TVM debugging
+# Paths preceded by 'tvm/src/'
+overrides = [
+    'ir/transform.cc=-1',
+    'relay/ir/transform.cc=-1',
+    'relay/ir/dataflow_matcher.cc=0',
+    'relay/ir/indexed_graph.cc=0',
+    'relay/backend/te_compiler.cc=2',
+    'relay/backend/vm/compiler.cc=2',
+    'tir/analysis/verify_memory.cc=0',
+    'tir/ir/data_layout.cc=0',
+    'target/compilation_config.cc=2',
+    # Turn off transforms printing
+    'relay/transforms/alter_op_layout.cc=0',
+    'relay/transforms/annotate_target.cc=0',
+    'relay/transforms/auto_scheduler_layout_rewrite.cc=0',
+    'relay/transforms/canonicalize_cast.cc=0',
+    'relay/transforms/canonicalize_ops.cc=0',
+    'relay/transforms/combine_parallel_batch_matmul.cc=0',
+    'relay/transforms/combine_parallel_conv2d.cc=0',
+    'relay/transforms/combine_parallel_dense.cc=0',
+    'relay/transforms/combine_parallel_op.cc=0',
+    'relay/transforms/combine_parallel_op_batch.cc=0',
+    'relay/transforms/compiler_function_utils.cc=0',
+    'relay/transforms/convert_layout.cc=0',
+    'relay/transforms/convert_sparse_conv2d.cc=0',
+    'relay/transforms/convert_sparse_dense.cc=0',
+    'relay/transforms/de_duplicate.cc=0',
+    'relay/transforms/dead_code.cc=0',
+    'relay/transforms/defunctionalization.cc=0',
+    'relay/transforms/defuse_ops.cc=0',
+    'relay/transforms/device_aware_visitors.cc=0',
+    'relay/transforms/device_domains.cc=0',
+    'relay/transforms/device_planner.cc=-1',
+    'relay/transforms/dynamic_to_static.cc=0',
+    'relay/transforms/eliminate_common_subexpr.cc=0',
+    'relay/transforms/eta_expand.cc=0',
+    'relay/transforms/expr_subst.cc=0',
+    'relay/transforms/fake_quantization_to_integer.cc=0',
+    'relay/transforms/fast_math.cc=0',
+    'relay/transforms/first_order_gradient.cc=0',
+    'relay/transforms/flatten_atrous_conv.cc=0',
+    'relay/transforms/fold_constant.cc=0',
+    'relay/transforms/fold_explicit_padding.cc=0',
+    'relay/transforms/fold_scale_axis.cc=0',
+    'relay/transforms/forward_rewrite.cc=0',
+    'relay/transforms/fuse_ops.cc=0',
+    'relay/transforms/higher_order_gradient.cc=0',
+    'relay/transforms/infer_layout_utils.cc=0',
+    'relay/transforms/inline.cc=0',
+    'relay/transforms/label_ops.cc=0',
+    'relay/transforms/lazy_gradient_init.cc=0',
+    'relay/transforms/legalize.cc=0',
+    'relay/transforms/memory_alloc.cc=0',
+    'relay/transforms/merge_compiler_regions.cc=0',
+    'relay/transforms/merge_composite.cc=0',
+    'relay/transforms/meta_schedule_layout_rewrite.cc=0',
+    'relay/transforms/partial_eval.cc=0',
+    'relay/transforms/partition_graph.cc=0',
+    'relay/transforms/simplify_expr.cc=0',
+    'relay/transforms/simplify_fc_transpose.cc=0',
+    'relay/transforms/simplify_inference.cc=0',
+    'relay/transforms/split_args.cc=0',
+    'relay/transforms/target_hooks.cc=0',
+    'relay/transforms/to_a_normal_form.cc=0',
+    'relay/transforms/to_basic_block_normal_form.cc=0',
+    'relay/transforms/to_cps.cc=0',
+    'relay/transforms/to_graph_normal_form.cc=0',
+    #'relay/transforms/to_mixed_precision.cc=0',
+    'relay/transforms/type_infer.cc=0',
+]
+os.environ['TVM_LOG_DEBUG'] = 'DEFAULT=1,' + ','.join(overrides)
+
 import tvm # built with BNNS support
 from tvm import relay, autotvm 
 import onnx # conda install onnx
@@ -117,7 +190,7 @@ def tune_tasks(
 # ONNX to relay translation is slow
 #  => cache results
 def load_relay_cached(model_path: str, batch_dim = 1):
-    cache = Path(__file__).parent / 'ckpts' / 'cache'
+    cache = Path(__file__).parent.parent / 'ckpts' / 'cache'
     
     print('MD5: ', end='')
     hash_object = hashlib.md5()
@@ -147,12 +220,16 @@ def load_relay_cached(model_path: str, batch_dim = 1):
             in_shapes[k] = [int(s) for s in v]
 
         # freeze_params converts dynamic shapes to static ones
-        mod, params = relay.frontend.from_onnx(model, shape=in_shapes, freeze_params=True)
+        print('Importing ONNX model')
+        mod, params = relay.frontend.from_onnx(model, shape=in_shapes, freeze_params=False)
+        
+        print('Exporting Relay model')
         graph.write_text(tvm.ir.save_json(mod))
         param.write_bytes(relay.save_param_dict(params))
 
     # Load
     try:
+        print('Loading cached Relay model')
         mod = tvm.ir.load_json(graph.read_text())
         mod.__class__.__orig_repr__ = mod.__class__.__repr__ 
         mod.__class__.__repr__ = lambda _: '__repr__ suppressed' # patch for laggy pydevd
@@ -160,18 +237,20 @@ def load_relay_cached(model_path: str, batch_dim = 1):
     except RuntimeError as e:
         print(e)
     
-    print('Relay model: applying optimizations')
-    mod = tvm.relay.transform.FastMath()(mod)
-    mod = tvm.relay.transform.EliminateCommonSubexpr()(mod)
-    BindPass = tvm.relay.transform.function_pass(lambda fn, new_mod, ctx:
-        tvm.relay.build_module.bind_params_by_name(fn, params), opt_level=1)
-    mod = BindPass(mod)
-    mod = tvm.relay.transform.FoldConstant()(mod)
-    mod = tvm.relay.transform.CombineParallelBatchMatmul()(mod)
-    mod = tvm.relay.transform.FoldConstant()(mod)
+    # print('Relay model: applying optimizations')
+    # mod = tvm.relay.transform.FastMath()(mod)
+    # mod = tvm.relay.transform.EliminateCommonSubexpr()(mod)
+    # BindPass = tvm.relay.transform.function_pass(lambda fn, new_mod, ctx:
+    #     tvm.relay.build_module.bind_params_by_name(fn, params), opt_level=1)
+    # mod = BindPass(mod)
+    # mod = tvm.relay.transform.FoldConstant()(mod)
+    # mod = tvm.relay.transform.CombineParallelBatchMatmul()(mod)
+    # mod = tvm.relay.transform.FoldConstant()(mod)
+
+    print('Skipping relay model optimizations')
 
     # TEST
-    mod = tvm.relay.transform.DynamicToStatic()(mod) # in onnx loader
+    #mod = tvm.relay.transform.DynamicToStatic()(mod) # in onnx loader
     #mod = tvm.relay.transform.ToMixedPrecision()(mod)
 
     return mod, params
@@ -182,9 +261,7 @@ def compile_autotvm(mod_name, ops=()):
 
     # TVM currently does not support dynamic input shapes
     # Relay Next will change this (github.com/tlc-pack/relax/wiki/Relax-Architecture-Overview)
-    batch_size = 2
-
-    print('Loading relay model')
+    batch_size = 1
     mod, params = load_relay_cached(mod_name, batch_size)
 
     # BNNS
@@ -237,10 +314,14 @@ def compile_autotvm(mod_name, ops=()):
 
     # Get tasks
     # nn.dense, nn.conv2d, nn.bias_add
-    print('Extracting tasks...')
-    ops = ['nn.conv2d', 'nn.dense', 'nn.bias_add'] + list(ops)
+    print('Extracting tasks... (will take >1h)')
+    #ops = ['nn.conv2d', 'nn.dense', 'nn.bias_add'] + list(ops)
+    t0 = time.time()
+    ops = ['nn.conv2d'] + list(ops)
     tasks = autotvm.task.extract_from_program(
         mod['main'], target=target, params=params, ops=[relay.op.get(n) for n in ops])
+    t1 = time.time()
+    print('Took', t1 - t0, 'seconds')
     
     assert tasks, 'No tasks found!'
     print('Found', len(tasks), 'tasks')
@@ -355,9 +436,12 @@ def compile_autotvm(mod_name, ops=()):
 
 #compile_tvmc(lat_norm) # OK
 
-unet = 'ckpts/unet_fp16_mps_512x512.onnx'
+#unet = Path(__file__).parent.parent / 'ckpts' / 'unet_fp16_mps_512x512_B1.onnx'
+unet = Path('/Users/erik/code/diffae/ckpts/ffhq256_lat.onnx')
 
 if __name__ == '__main__':
+    print('PID:', os.getpid()) # for lldb attach
+
     #compile_tvmc(unet)
     compile_autotvm(unet)
 

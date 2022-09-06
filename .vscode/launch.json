@@ -5,19 +5,35 @@
     "version": "0.2.0",
     "configurations": [
         {
-            "name": "Interactive",
-            "type": "python",
-            "request": "launch",
-            "program": "${workspaceFolder}/interactive.py",
-            "console": "integratedTerminal",
-            "justMyCode": true,
-            "args": []
+            "name": "(lldb) Attach",
+            "type": "cppdbg",
+            "request": "attach",
+            "program": "/Users/erik/opt/miniconda3/envs/ldm/bin/python", // same as ONNX target below
+            "processId": "${command:pickProcess}",
+            "MIMode": "lldb",
+            "setupCommands": [
+                { 
+                    "text": "-enable-pretty-printing",
+                    "description": "enable pretty printing", 
+                    "ignoreFailures": true 
+                }
+            ]
         },
         {
             "name": "ONNX",
             "type": "python",
             "request": "launch",
             "program": "${workspaceFolder}/onnx/run.py",
+            "console": "integratedTerminal",
+            "python": "/Users/erik/opt/miniconda3/envs/ldm/bin/python",
+            "justMyCode": true,
+            "args": []
+        },
+        {
+            "name": "Interactive",
+            "type": "python",
+            "request": "launch",
+            "program": "${workspaceFolder}/interactive.py",
             "console": "integratedTerminal",
             "justMyCode": true,
             "args": []

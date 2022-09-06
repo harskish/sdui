@@ -391,12 +391,8 @@ class ModelViz(ToolbarViewer):
         img = Image.fromarray(np.uint8(255*out_np))
         self.get_cond_from_img(img)
 
-    def export_to_onnx(self, model):
+    def export_to_onnx(self, model, force=False):
         dtype = { torch.float16: 'fp16', torch.float32: 'fp32' }[self.dtype]
-        fname = Path(f'ckpts/unet_{dtype}_{device}_{self.state.H}x{self.state.W}.onnx')
-        if fname.is_file():
-            print('Already exported, skipping')
-            return
 
         inner = model.model.diffusion_model
         inner.eval()
@@ -405,22 +401,61 @@ class ModelViz(ToolbarViewer):
             p.requires_grad_(False)
 
         assert model.model.conditioning_key == 'crossattn'
-        x_in = torch.randn(2, *get_act_shape(self.state), device=device, dtype=self.dtype) # [2, 4, 64, 64]
-        t_in = torch.tensor([1, 1], device=device, dtype=torch.int64) # [2]
-        c_in = torch.randn((2, 77, 768), device=device, dtype=self.dtype) # [2, 77, 768]
+        
+        B = 1
+        x_in = torch.randn(B, *get_act_shape(self.state), device=device, dtype=self.dtype) # [B, 4, 64, 64]
+        t_in = torch.ones(B, 1, device=device, dtype=torch.int64) # [B, 1]
+        c_in = torch.randn((B, 2, 77, 768), device=device, dtype=self.dtype) # [B, 2, 77, 768]
         ex_inputs = (x_in, t_in, c_in)
         input_names = ['x', 't', 'c']
-        
-        print('Jitting')
-        fwd_fun = lambda x, t, context: inner.forward(x, t, context=context) # [(e_t_uncond, e_t), 4, 64, 64]
-        jitted = torch.jit.trace(fwd_fun, ex_inputs, check_trace=False)
 
-        print('Exporting')
-        makedirs(fname.parent, exist_ok=True)
-        torch.onnx.export(jitted, ex_inputs, fname, input_names=input_names,
-            output_names=['et_uc_c'], do_constant_folding=True, opset_version=12) # einsum
-        
-        print('Exported as', fname)
+        jitted = None
+        for dyn_b, dyn_sz in [(False, False), (True, False), (True, True)]:
+            desc = '_dynHW' if dyn_sz else f'_{self.state.H}x{self.state.W}'
+            desc = f'{desc}_dynB' if dyn_b else f'{desc}_B{B}'
+            fname = Path(f'ckpts/unet_{dtype}_{device}{desc}.onnx')
+            if fname.is_file() and not force:
+                print('Already exported, skipping')
+                continue
+            
+            def fwd_fun(x: torch.Tensor, t: torch.Tensor, c: torch.Tensor):
+                # Duplicate twice using same underlying memory
+                x = x.repeat_interleave(2, dim=0)                 # [B, 4, 64, 64] => [B*2, 4, 64, 64]
+                t = t.repeat_interleave(2, dim=0).view(-1)        # [B, 1] => [B*2]
+                c = c.view(2 * c.shape[0], *c.shape[2:])          # [B, 2, 77, 768] => [B*2, 77, 768]
+                ret = inner.forward(x, t, context=c)              # [B*2, 4, 64, 64]
+                ret = ret.view(-1, 2, *get_act_shape(self.state)) # [B, 2, 4, 64, 64]
+                return ret
+                
+            if jitted is None:
+                print('Jitting')
+                jitted = torch.jit.trace(fwd_fun, ex_inputs, check_trace=False)
+
+            def get_dynamic_axes(dynamic_B=False, dynamic_res=False):
+                if not (dynamic_B or dynamic_res):
+                    return None
+                
+                axes = { 'x': {}, 't': {}, 'c': {}, 'et_uc_c': {} }
+                if dynamic_B:
+                    axes['x'][0] = 'batch_dim'
+                    axes['t'][0] = 'batch_dim'
+                    axes['c'][0] = 'batch_dim'
+                    axes['et_uc_c'][0] = 'batch_dim'
+                if dynamic_res:
+                    axes['x'][2] = 'height'
+                    axes['x'][3] = 'width'
+                    axes['et_uc_c'][3] = 'height'
+                    axes['et_uc_c'][4] = 'width'
+
+                return axes
+
+            print('Exporting')
+            makedirs(fname.parent, exist_ok=True)
+            torch.onnx.export(jitted, ex_inputs, fname,
+                input_names=input_names, output_names=['et_uc_c'], opset_version=13, # einsum, dynamic rep._interl.
+                do_constant_folding=False, dynamic_axes=get_dynamic_axes(dyn_b, dyn_sz))
+            
+            print('Exported as', fname)
 
     def compute(self):
         # Copy for this frame
