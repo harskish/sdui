@@ -64,7 +64,6 @@ def file_drop_callback(window, paths, viewer):
     hovering_img = posx > viewer.toolbar_width
     
     for p in paths:
-        suff = Path(p).suffix.lower()
         if hovering_img:
             # Hovering over image => load as UI state
             viewer.load_state_from_img(p)
@@ -303,6 +302,7 @@ class ModelViz(ToolbarViewer):
         # Ignore certain values
         ignores = ['fp16']
         state_dict = { k: v for k,v in state_dict.items() if k not in ignores }
+        state_dict_soft = { k: v for k,v in state_dict_soft.items() if k not in ignores }
     
         for k, v in state_dict.items():
             setattr(self.state, k, v)
@@ -324,7 +324,8 @@ class ModelViz(ToolbarViewer):
 
     # After init or state load
     def post_init(self):
-        self.state.attn_group_size = attention.ATTN_GROUP_SIZE = min(attention.ATTN_GROUP_SIZE, self.state.attn_group_size)
+        self.state_soft.attn_group_size = attention.ATTN_GROUP_SIZE = \
+            min(attention.ATTN_GROUP_SIZE, self.state_soft.attn_group_size)
         self.reshape_image_cond()
         self.prompt_curr = self.state.prompt
 
@@ -528,12 +529,12 @@ class ModelViz(ToolbarViewer):
             self.reshape_image_cond()
         
         # Speed-VRAM tradeoff, larger = faster
-        ch, s.attn_group_size = combo_box_vals('Attn. group size', [2, 4, 8, 16], s.attn_group_size)
+        ch, self.state_soft.attn_group_size = combo_box_vals('Attn. group size', [2, 4, 8, 16], self.state_soft.attn_group_size)
         if imgui.is_item_hovered():
             imgui.set_tooltip('Attention group size, smaller values reduce VRAM requirement at the cost of speed')
         if ch:
             torch.cuda.empty_cache()
-            attention.ATTN_GROUP_SIZE = s.attn_group_size
+            attention.ATTN_GROUP_SIZE = self.state_soft.attn_group_size
 
         s.sampler_type = combo_box_vals('Sampler', SAMPLERS_ALL if s.image_cond is None else SAMPLERS_IMG2IMG, s.sampler_type)[1]
         s.guidance_scale = slider_dynamic('Guidance', s.guidance_scale, 0, 20)[1]
@@ -578,7 +579,6 @@ class UIState:
     f: int = 8
     fp16: bool = True
     guidance_scale: float = 8.0 # classifier guidance
-    attn_group_size: int = 16
     sampler_type: str = 'k_euler'
     image_cond: str = None
     image_cond_strength: float = 7.0 # [0, 10]
@@ -592,6 +592,7 @@ class UIState:
 @dataclass
 class UIStateSoft:
     preview_interval: int = 5
+    attn_group_size: int = 16
 
 @dataclass
 class RendererState:
