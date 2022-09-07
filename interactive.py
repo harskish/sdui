@@ -390,8 +390,11 @@ class ModelViz(ToolbarViewer):
         np_img = np_img[None].transpose(0, 3, 1, 2)
         init_image = 2 * torch.tensor(np_img.copy()).to(self.dtype).to(device) - 1
 
-        enc = self.rend.model.encode_first_stage(init_image)
-        init_latent = self.rend.model.get_first_stage_encoding(enc)  # computes mean + std * randn()
+        # Encoder produces (mean, logvar) that parametrize diagonal gaussian, which is sampled
+        # Smaller output => ill-posed, need distribution
+        encoded = self.rend.model.encode_first_stage(init_image)
+        encoded.std *= 0 # use mean directly, no variance
+        init_latent = self.rend.model.get_first_stage_encoding(encoded)  # computes (mean + std * randn(...))*scale_factor
         
         _, C, H_per_f, W_per_f = init_latent.shape
         assert C == self.state.C, 'C does not match'
@@ -409,10 +412,11 @@ class ModelViz(ToolbarViewer):
 
             mask = torch.zeros((1, 1, H_per_f, W_per_f), device=device, dtype=self.dtype)
             mask[:, :, top_y:bot_y, lef_x:rig_x] = 1
-            # self.rend.cond_img_mask = 1 - mask  # forces inner part to stay unchanged
+            self.rend.cond_img_mask = 1 - mask  # forces inner part to stay unchanged
             
             # Use random init for outside parts
-            init_latent = mask * init_latent + (1 - mask) * torch.randn_like(init_latent) * enc.std
+            # Not needed? This is the final latent which is noised anyway later
+            #init_latent = mask * init_latent + (1 - mask) * torch.randn_like(init_latent) * encoded.std * self.rend.model.scale_factor
         else:
             self.rend.cond_img_mask = None
         
@@ -516,8 +520,8 @@ class ModelViz(ToolbarViewer):
             
             if s.image_cond is not None:
                 # img2img
-                arr = b64_to_arr(s.image_cond, np.float16).reshape([1, *shape])
-                t = torch.tensor(arr, device=device).repeat((s.B, 1, 1, 1)).to(self.dtype)
+                x0_np = b64_to_arr(s.image_cond, np.float16).reshape([1, *shape])
+                x0 = torch.tensor(x0_np, device=device).repeat((s.B, 1, 1, 1)).to(self.dtype)
                 strength = 1 - (s.image_cond_strength - 1) / 10 # [1, 10] => [0, 9] => [1.0, 0.1]
                 t_enc = max(2, int(strength * s.T)) # less than two breaks image
 
@@ -530,14 +534,36 @@ class ModelViz(ToolbarViewer):
 
                 # TODO: instead provide cross-platform randn_like to samplers as callback
                 seed_everything(s.seed)
-                if self.state.sampler_type == 'ddim':    
-                    # TODO: handle mask?
-                    self.rend.sampler.make_schedule(s.T, ddim_eta=0.0, verbose=False)
-                    z_enc = self.rend.sampler.stochastic_encode(t, torch.tensor([t_enc]*s.B).to(device), noise=noises)
-                    self.rend.sampler.decode(z_enc.to(t.dtype), c, t_enc, unconditional_conditioning=uc, 
-                        unconditional_guidance_scale=s.guidance_scale, img_callback=cbk_img)
+                
+                if self.state.sampler_type == 'ddim':
+                    # TEST: outpainting using text2img
+                    if self.rend.cond_img_mask is not None:
+                        seeds = [s.seed + i for i in range(s.B)]
+                        start_code = seeds_to_samples(seeds, (len(seeds), *shape)).to(self.dtype).to(device)
+                        self.rend.sampler.sample(
+                            S=s.T,
+                            conditioning=c,
+                            batch_size=s.B,
+                            shape=shape,
+                            verbose=False,
+                            unconditional_guidance_scale=s.guidance_scale,
+                            unconditional_conditioning=uc,
+                            eta=0.0, 
+                            x_T=start_code,                  # latent at end of noising process (step T)
+                            mask=1-self.rend.cond_img_mask,  # mask for out-/inpainting, inverted...!
+                            x0=x0,                           # clean latent of cond image
+                            img_callback=cbk_img)
+                    else:
+                        # Add noise to clean latent based on starting point in diffusion process
+                        # TODO: ddpm_model.q_sample() vs ddim_sampler.stochastic_encode()?
+                        self.rend.sampler.make_schedule(s.T, ddim_eta=0.0, verbose=False)
+                        z_enc = self.rend.sampler.stochastic_encode(x0, torch.tensor([t_enc]*s.B).to(device), noise=noises)
+                        
+                        # Run diffusion process from chosen starting point
+                        self.rend.sampler.decode(z_enc.to(x0.dtype), c, t_enc, unconditional_conditioning=uc, 
+                            unconditional_guidance_scale=s.guidance_scale, img_callback=cbk_img)
                 else:
-                    ret = self.rend.sampler.decode(t, c, noises, t_enc, s.T, unconditional_conditioning=uc,
+                    ret = self.rend.sampler.decode(x0, c, noises, t_enc, s.T, unconditional_conditioning=uc,
                         unconditional_guidance_scale=s.guidance_scale, mask=self.rend.cond_img_mask, img_callback=cbk_img)
                     cbk_img(ret, s.T - 1) # iteration exits early, show last image
             else:
