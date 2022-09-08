@@ -39,8 +39,8 @@ from ldm.modules.encoders.modules import get_default_device_type
 from ldm.modules import attention
 #from viewer.single_image_viewer import draw as draw_debug
 
-SAMPLERS_IMG2IMG = ['ddim', 'k_dpm_2_a', 'k_dpm_2', 'k_euler_a', 'k_euler', 'k_heun', 'k_lms']
-SAMPLERS_ALL = SAMPLERS_IMG2IMG + ['plms']
+SAMPLERS_IMG2IMG = ['k_dpm_2_a', 'k_dpm_2', 'k_euler_a', 'k_euler', 'k_heun', 'k_lms']
+SAMPLERS_ALL = SAMPLERS_IMG2IMG + ['ddim', 'plms']
 
 # Suppress CLIP warning
 import transformers
@@ -518,67 +518,46 @@ class ModelViz(ToolbarViewer):
                     H, W, C = grid.shape
                     self.img_shape = (C, H, W)
             
+            # TODO: need to seed whole diffusion process, not just initial rand
+            seeds = [s.seed + i for i in range(s.B)]
+            xT = seeds_to_samples(seeds, (len(seeds), *shape)).to(self.dtype).to(device)
+
+            t_img2img = 0
+            x0 = None
             if s.image_cond is not None:
-                # img2img
                 x0_np = b64_to_arr(s.image_cond, np.float16).reshape([1, *shape])
                 x0 = torch.tensor(x0_np, device=device).repeat((s.B, 1, 1, 1)).to(self.dtype)
                 strength = 1 - (s.image_cond_strength - 1) / 10 # [1, 10] => [0, 9] => [1.0, 0.1]
-                t_enc = max(2, int(strength * s.T)) # less than two breaks image
-
+                t_img2img = int(strength * s.T)
+                
                 # Image suffers if using same noise in encode and cond image generation
                 # => make sure sequences differ
                 # TODO: need to seed whole diffusion process, not just initial rand
                 base = djb2_hash(s.image_cond_hash) # hash loaded from state dump => deterministic
                 seeds = [(base + s.seed + i) % (1<<32-1) for i in range(s.B)]
-                noises = seeds_to_samples(seeds, (len(seeds), *shape)).to(device).to(self.dtype)
+                xT = seeds_to_samples(seeds, (len(seeds), *shape)).to(device).to(self.dtype)
+            
+            seed_everything(s.seed)
 
-                # TODO: instead provide cross-platform randn_like to samplers as callback
-                seed_everything(s.seed)
-                
-                if self.rend.cond_img_mask is not None:
-                    # Outpainting using text2img
-                    seeds = [s.seed + i for i in range(s.B)]
-                    start_code = seeds_to_samples(seeds, (len(seeds), *shape)).to(self.dtype).to(device)
-                    self.rend.sampler.sample(
-                        S=s.T,
-                        conditioning=c,
-                        batch_size=s.B,
-                        shape=shape,
-                        verbose=False,
-                        unconditional_guidance_scale=s.guidance_scale,
-                        unconditional_conditioning=uc,
-                        eta=0.0, 
-                        x_T=start_code,                  # latent at end of noising process (step T)
-                        mask=1-self.rend.cond_img_mask,  # mask for out-/inpainting, inverted...!
-                        x0=x0,                           # clean latent of cond image
-                        img_callback=cbk_img)
-                elif self.state.sampler_type == 'ddim':
-                    # Standard img2img
-
-                    # Add noise to clean latent based on starting point in diffusion process
-                    # TODO: ddpm_model.q_sample() vs ddim_sampler.stochastic_encode()?
-                    self.rend.sampler.make_schedule(s.T, ddim_eta=0.0, verbose=False)
-                    z_enc = self.rend.sampler.stochastic_encode(x0, torch.tensor([t_enc]*s.B).to(device), noise=noises)
-                    
-                    # Run diffusion process from chosen starting point
-                    self.rend.sampler.decode(z_enc.to(x0.dtype), c, t_enc, unconditional_conditioning=uc, 
-                        unconditional_guidance_scale=s.guidance_scale, img_callback=cbk_img)
-                else:
-                    # Standard img2img
-                    ret = self.rend.sampler.decode(x0, c, noises, t_enc, s.T, unconditional_conditioning=uc,
-                        unconditional_guidance_scale=s.guidance_scale, mask=self.rend.cond_img_mask, img_callback=cbk_img)
-                    cbk_img(ret, s.T - 1) # iteration exits early, show last image
-            else:
-                # txt2img
-                # TODO: need to seed whole diffusion process, not just initial rand
-                seeds = [s.seed + i for i in range(s.B)]
-                start_code = seeds_to_samples(seeds, (len(seeds), *shape)).to(self.dtype).to(device)
-
-                # Random initial noise
-                seed_everything(s.seed)
+            if self.state.sampler_type not in SAMPLERS_IMG2IMG:
+                # txt2img on ddim/plms
                 self.rend.sampler.sample(S=s.T, conditioning=c, batch_size=s.B,
                     shape=shape, verbose=False, unconditional_guidance_scale=s.guidance_scale,
-                    unconditional_conditioning=uc, eta=0.0, x_T=start_code, img_callback=cbk_img)
+                    unconditional_conditioning=uc, eta=0.0, x_T=xT, img_callback=cbk_img)
+            else:
+                # txt2img, img2img or mixed, k-samplers
+                out, _ = self.rend.sampler.sample_general(
+                    steps_tot=s.T,
+                    steps_img2img=t_img2img,
+                    c=c,
+                    guidance_scale=s.guidance_scale,
+                    uc=uc,
+                    x_T=xT,
+                    x0=x0,
+                    mask=self.rend.cond_img_mask,
+                    img_callback=cbk_img
+                )
+                cbk_img(out, s.T - 1)
         except UserAbort:
             # UI state changed, restart rendering
             return None
@@ -647,6 +626,7 @@ class ModelViz(ToolbarViewer):
                 with self.state_lock:
                     self.rend.cond_img_handle = None
                     self.rend.cond_img_orig = None
+                    self.rend.cond_img_mask = None
                     s.image_cond = None
                     s.image_cond_hash = None
             imgui.same_line()

@@ -40,8 +40,57 @@ class KDiffusionSampler:
     def get_sampler_name(self):
         return self.schedule
     
+    # txt2img in masked regions, then img2img after chosen threshold
+    def sample_general(
+        self,
+        steps_tot,          # number of total steps
+        steps_img2img,      # number of steps for performing img2img at the end
+        c,                  # c, cond from prompt
+        guidance_scale,     # classifier free guidance scale
+        uc,                 # uc, cond from empty prompt
+        x_T,                # final noised latent, pure Gaussian noise
+        x0=None,            # initial noise-free latent if out-/inpainting, optional
+        mask=None,          # mask if out-/inpainting, optional
+        img_callback=None,  # callback for showing progress
+    ):
+        assert steps_tot > 0 and steps_img2img >= 0, 'Invalid step counts'
+        assert steps_img2img <= steps_tot, 'steps_img2img cannot be larger than total number of steps'
+        
+        # TODO: supply list of random numbers for whole diffusion process
+        
+        steps_txt2img = steps_tot - steps_img2img
+        model_wrap_cfg = CFGMaskedDenoiser(self.model_wrap)
+        func = getattr(K.sampling, f'sample_{self.schedule}')
+        sigmas = self.model_wrap.get_sigmas(steps_tot).to(c.dtype) # linear resampling of original sigmas
+        x = x_T * sigmas[0]
+
+        print(f'Running {steps_txt2img} steps txt2img + {steps_img2img} steps img2img')
+
+        def cbk(vals: dict):
+            if img_callback:
+                img_callback(vals['denoised'], vals['i'])
+        
+        # text2img
+        # x0 supplied to let generated region adapt to target
+        # allows only out-/inpainted region to change
+        if steps_txt2img > 0:
+            # Skip ahead if pure img2img
+            if mask is None and x0 is not None:
+                x = x0 + sigmas[steps_tot - steps_img2img - 1] * torch.randn_like(x0)
+            else:
+                x = func(model_wrap_cfg, x, sigmas[:(steps_txt2img + 1)], disable=False, callback=cbk,
+                    extra_args={'cond': c, 'uncond': uc, 'cond_scale': guidance_scale, 'mask': mask, 'x0': x0})
+
+        # img2img
+        # allows whole image (including masked input region) to change
+        if steps_img2img > 0:
+            x = func(model_wrap_cfg, x, sigmas[(steps_tot - steps_img2img - 1):], disable=False, callback=cbk,
+                extra_args={'cond': c, 'uncond': uc, 'cond_scale': guidance_scale, 'mask': None, 'x0': None})
+
+        return x, None
+    
     def sample(self, S, conditioning, batch_size, shape, verbose, unconditional_guidance_scale, unconditional_conditioning, eta, x_T, img_callback, mask=None, x0=None):
-        sigmas = self.model_wrap.get_sigmas(S).to(conditioning.dtype) # linear resampling of original sigmas
+        sigmas = self.model_wrap.get_sigmas(S).to(conditioning.dtype)
         x = x_T * sigmas[0]
         model_wrap_cfg = CFGMaskedDenoiser(self.model_wrap)
 
