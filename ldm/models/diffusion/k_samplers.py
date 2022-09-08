@@ -1,12 +1,7 @@
 import torch
 from pathlib import Path
 import sys
-
-kdiff_root = Path(__file__).parent / 'k-diffusion'
-assert kdiff_root.is_dir() and len(list(kdiff_root.glob('*'))), \
-    'Submodules missing; please run "git submodule update --init --recursive"'
-sys.path += [str(kdiff_root)]
-import k_diffusion as K # type: ignore
+from . import k_diffusion as K
 
 class CFGDenoiser(torch.nn.Module):
     def __init__(self, model):
