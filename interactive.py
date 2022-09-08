@@ -535,34 +535,36 @@ class ModelViz(ToolbarViewer):
                 # TODO: instead provide cross-platform randn_like to samplers as callback
                 seed_everything(s.seed)
                 
-                if self.state.sampler_type == 'ddim':
-                    # TEST: outpainting using text2img
-                    if self.rend.cond_img_mask is not None:
-                        seeds = [s.seed + i for i in range(s.B)]
-                        start_code = seeds_to_samples(seeds, (len(seeds), *shape)).to(self.dtype).to(device)
-                        self.rend.sampler.sample(
-                            S=s.T,
-                            conditioning=c,
-                            batch_size=s.B,
-                            shape=shape,
-                            verbose=False,
-                            unconditional_guidance_scale=s.guidance_scale,
-                            unconditional_conditioning=uc,
-                            eta=0.0, 
-                            x_T=start_code,                  # latent at end of noising process (step T)
-                            mask=1-self.rend.cond_img_mask,  # mask for out-/inpainting, inverted...!
-                            x0=x0,                           # clean latent of cond image
-                            img_callback=cbk_img)
-                    else:
-                        # Add noise to clean latent based on starting point in diffusion process
-                        # TODO: ddpm_model.q_sample() vs ddim_sampler.stochastic_encode()?
-                        self.rend.sampler.make_schedule(s.T, ddim_eta=0.0, verbose=False)
-                        z_enc = self.rend.sampler.stochastic_encode(x0, torch.tensor([t_enc]*s.B).to(device), noise=noises)
-                        
-                        # Run diffusion process from chosen starting point
-                        self.rend.sampler.decode(z_enc.to(x0.dtype), c, t_enc, unconditional_conditioning=uc, 
-                            unconditional_guidance_scale=s.guidance_scale, img_callback=cbk_img)
+                if self.rend.cond_img_mask is not None:
+                    # Outpainting using text2img
+                    seeds = [s.seed + i for i in range(s.B)]
+                    start_code = seeds_to_samples(seeds, (len(seeds), *shape)).to(self.dtype).to(device)
+                    self.rend.sampler.sample(
+                        S=s.T,
+                        conditioning=c,
+                        batch_size=s.B,
+                        shape=shape,
+                        verbose=False,
+                        unconditional_guidance_scale=s.guidance_scale,
+                        unconditional_conditioning=uc,
+                        eta=0.0, 
+                        x_T=start_code,                  # latent at end of noising process (step T)
+                        mask=1-self.rend.cond_img_mask,  # mask for out-/inpainting, inverted...!
+                        x0=x0,                           # clean latent of cond image
+                        img_callback=cbk_img)
+                elif self.state.sampler_type == 'ddim':
+                    # Standard img2img
+
+                    # Add noise to clean latent based on starting point in diffusion process
+                    # TODO: ddpm_model.q_sample() vs ddim_sampler.stochastic_encode()?
+                    self.rend.sampler.make_schedule(s.T, ddim_eta=0.0, verbose=False)
+                    z_enc = self.rend.sampler.stochastic_encode(x0, torch.tensor([t_enc]*s.B).to(device), noise=noises)
+                    
+                    # Run diffusion process from chosen starting point
+                    self.rend.sampler.decode(z_enc.to(x0.dtype), c, t_enc, unconditional_conditioning=uc, 
+                        unconditional_guidance_scale=s.guidance_scale, img_callback=cbk_img)
                 else:
+                    # Standard img2img
                     ret = self.rend.sampler.decode(x0, c, noises, t_enc, s.T, unconditional_conditioning=uc,
                         unconditional_guidance_scale=s.guidance_scale, mask=self.rend.cond_img_mask, img_callback=cbk_img)
                     cbk_img(ret, s.T - 1) # iteration exits early, show last image
