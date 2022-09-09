@@ -11,7 +11,9 @@
             "program": "${workspaceFolder}/interactive.py",
             "console": "integratedTerminal",
             "justMyCode": true,
-            "args": []
+            "args": [
+                //"C:/Users/Erik/code/sdui/outputs/20220909_143820.png"
+            ]
         },
         {
             "name": "Sample",

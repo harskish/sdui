@@ -1,4 +1,5 @@
 import torch
+from torch.nn import functional as F
 from pathlib import Path
 import sys
 from . import k_diffusion as K
@@ -11,12 +12,14 @@ class CFGMaskedDenoiser(torch.nn.Module):
     def forward(self, x, sigma, uncond, cond, cond_scale, mask, x0): #, xi):
         # Inplace modification
         # => visible for caller
-        if mask is not None:
-            assert x0 is not None
-            assert not x.requires_grad, 'Inplace ops break grads'
-            img_orig = x0 + sigma * torch.randn_like(x0)
-            x.mul_(1 - mask)
-            x.add_(img_orig * mask)
+        # if mask is not None:
+        #     assert x0 is not None
+        #     assert not x.requires_grad, 'Inplace ops break grads'
+        #     img_orig = x0 + sigma * torch.randn_like(x0)
+        #     x.copy_(x * (1 - mask) + img_orig * mask)
+            
+        #     # TEST
+        #     x[-1, -1, -1, -1].copy_(torch.tensor(1337, dtype=x.dtype, device=x.device))
         
         denoised = None
         if uncond is None or cond_scale == 1:
@@ -61,31 +64,37 @@ class KDiffusionSampler:
         steps_txt2img = steps_tot - steps_img2img
         model_wrap_cfg = CFGMaskedDenoiser(self.model_wrap)
         func = getattr(K.sampling, f'sample_{self.schedule}')
-        sigmas = self.model_wrap.get_sigmas(steps_tot).to(c.dtype) # linear resampling of original sigmas
+        sigmas = self.model_wrap.get_sigmas(steps_tot).to(c.dtype) # linear resampling of original sigmas + final zero
         x = x_T * sigmas[0]
 
-        print(f'Running {steps_txt2img} steps txt2img + {steps_img2img} steps img2img')
-
-        def cbk(vals: dict):
+        def callback(vals: dict):
+            i = vals['i']
+            
+            # Inplace modification
+            # => visible to caller
+            if mask is not None and i < steps_txt2img:
+                x = vals['x']
+                assert not x.requires_grad, 'Inplace ops break grads'
+                assert x0 is not None
+                img_orig = x0 + vals['sigma'] * torch.randn_like(x0)
+                x.copy_(x * mask + img_orig * (1 - mask))
+                #x[-1, -1, -1, -1].mul_(0) # TEST
+            
             if img_callback:
                 img_callback(vals['denoised'], vals['i'])
         
-        # text2img
-        # x0 supplied to let generated region adapt to target
-        # allows only out-/inpainted region to change
-        if steps_txt2img > 0:
-            # Skip ahead if pure img2img
-            if mask is None and x0 is not None:
-                x = x0 + sigmas[steps_tot - steps_img2img - 1] * torch.randn_like(x0)
-            else:
-                x = func(model_wrap_cfg, x, sigmas[:(steps_txt2img + 1)], disable=False, callback=cbk,
-                    extra_args={'cond': c, 'uncond': uc, 'cond_scale': guidance_scale, 'mask': mask, 'x0': x0})
 
-        # img2img
-        # allows whole image (including masked input region) to change
-        if steps_img2img > 0:
-            x = func(model_wrap_cfg, x, sigmas[(steps_tot - steps_img2img - 1):], disable=False, callback=cbk,
-                extra_args={'cond': c, 'uncond': uc, 'cond_scale': guidance_scale, 'mask': None, 'x0': None})
+        # Skip ahead if pure unmasked img2img
+        if steps_txt2img > 0 and mask is None and x0 is not None:
+            sigmas = sigmas[(steps_tot - steps_img2img - 1):]
+            x = x0 + x_T * sigmas[0]
+            print(f'Skipping {steps_txt2img} steps txt2img, running {steps_img2img} steps img2img')
+        else:
+            print(f'Running {steps_txt2img} steps txt2img + {steps_img2img} steps img2img')
+        
+        # Run txt2img first if in-/outpainting, then run img2img
+        x = func(model_wrap_cfg, x, sigmas, disable=False, callback=callback,
+            extra_args={'cond': c, 'uncond': uc, 'cond_scale': guidance_scale, 'mask': mask, 'x0': x0})
 
         return x, None
     

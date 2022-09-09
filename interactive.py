@@ -18,6 +18,7 @@ from contextlib import nullcontext
 from base64 import b64encode, b64decode
 from pathlib import Path
 from glfw import KEY_LEFT_SHIFT
+from torch.nn.functional import conv2d
 import gdown
 import glfw
 import hashlib
@@ -37,7 +38,7 @@ from ldm.models.diffusion.k_samplers import KDiffusionSampler
 from ldm.models.diffusion.ddpm import LatentDiffusion
 from ldm.modules.encoders.modules import get_default_device_type
 from ldm.modules import attention
-#from viewer.single_image_viewer import draw as draw_debug
+from viewer.single_image_viewer import draw as draw_debug
 
 SAMPLERS_IMG2IMG = ['k_dpm_2_a', 'k_dpm_2', 'k_euler_a', 'k_euler', 'k_heun', 'k_lms']
 SAMPLERS_ALL = SAMPLERS_IMG2IMG + ['ddim', 'plms']
@@ -366,8 +367,7 @@ class ModelViz(ToolbarViewer):
         W, H = self.state.W, self.state.H
         w, h = image.size
 
-        bg_color = imgui.get_style().colors[imgui.COLOR_WINDOW_BACKGROUND][0:3]
-        canvas = Image.new(image.mode, (W, H), tuple(map(lambda c: int(255*c), bg_color)))
+        canvas = Image.new(image.mode, (W, H), (0, 0, 0))
 
         if (W, H) == (w, h):
             pass # no processing needed
@@ -404,16 +404,41 @@ class ModelViz(ToolbarViewer):
             lef_x, top_y = top_left
             rig_x, bot_y = (lef_x + w, top_y + h)
             
+            blur_R = 1
+            mask = torch.ones((1, 1, H_per_f, W_per_f), device=device, dtype=self.dtype)
+
             # Conservative valid image ranges
             lef_x = int(np.ceil(lef_x / self.state.f))
             rig_x = int(np.floor(rig_x / self.state.f))
             top_y = int(np.ceil(top_y / self.state.f))
             bot_y = int(np.floor(bot_y / self.state.f))
 
-            mask = torch.zeros((1, 1, H_per_f, W_per_f), device=device, dtype=self.dtype)
-            mask[:, :, top_y:bot_y, lef_x:rig_x] = 1
-            self.rend.cond_img_mask = 1 - mask  # forces inner part to stay unchanged
+            # Even more conservative (need to account for blur radius)
+            top_y = top_y + blur_R if top_y > 0 else top_y
+            lef_x = lef_x + blur_R if lef_x > 0 else lef_x
+            bot_y = bot_y - blur_R if bot_y < H_per_f else bot_y
+            rig_x = rig_x - blur_R if rig_x < W_per_f else rig_x
+            mask[:, :, top_y:bot_y, lef_x:rig_x] = 0
+
+            draw_debug(img_chw=mask[0])
             
+            # Blur mask to reduce sharp transition
+            if blur_R > 0:    
+                gauss_kernel = torch.tensor([
+                    [1, 2, 1],
+                    [2, 4, 2],
+                    [1, 2, 1],
+                ], dtype=mask.dtype, device=mask.device).view(1, 1, 3, 3)
+                gauss_kernel /= gauss_kernel.sum()
+                assert blur_R == 1, 'Not implemented'
+                conv = torch.nn.Conv2d(3, 3, 3, paddimg=1, padding_mode='border')
+                conv.weight = gauss_kernel # [out_ch, in_ch/groups, kernel_size[0], kernel_size[1]]
+                raise RuntimeError('FIX')
+                #mask = conv(mask, gauss_kernel, padding=1).clip(0, 1)
+                draw_debug(img_chw=mask[0])
+            
+            self.rend.cond_img_mask = mask
+
             # Use random init for outside parts
             # Not needed? This is the final latent which is noised anyway later
             #init_latent = mask * init_latent + (1 - mask) * torch.randn_like(init_latent) * encoded.std * self.rend.model.scale_factor
