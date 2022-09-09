@@ -2,6 +2,7 @@ import torch
 import torch.nn as nn
 from functools import partial
 import clip
+from pathlib import Path
 from einops import rearrange, repeat
 from transformers import CLIPTokenizer, CLIPTextModel
 import kornia
@@ -147,8 +148,10 @@ class FrozenCLIPEmbedder(AbstractEncoder):
     """Uses the CLIP transformer encoder for text (from Hugging Face)"""
     def __init__(self, version="openai/clip-vit-large-patch14", device=get_default_device_type(), max_length=77):
         super().__init__()
-        self.tokenizer = CLIPTokenizer.from_pretrained(version)
-        self.transformer = CLIPTextModel.from_pretrained(version)
+        cache = Path('~/.cache/sdui').expanduser()
+        local_only = len(list(cache.glob('*'))) >= 12 # only DL on first startup, don't check for updates
+        self.tokenizer = CLIPTokenizer.from_pretrained(version, cache_dir=cache, local_files_only=local_only)
+        self.transformer = CLIPTextModel.from_pretrained(version, cache_dir=cache, local_files_only=local_only)
         self.device = device
         self.max_length = max_length
         self.freeze()
