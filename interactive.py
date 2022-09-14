@@ -328,9 +328,8 @@ class ModelViz(ToolbarViewer):
         if 'image_cond' in state_dict:
             self.rend.cond_img_handle = None
 
-        self.post_init()
-        
         self.state_lock.release()
+        self.post_init()
 
     # After init or state load
     def post_init(self):
