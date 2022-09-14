@@ -404,7 +404,7 @@ class ModelViz(ToolbarViewer):
             lef_x, top_y = top_left
             rig_x, bot_y = (lef_x + w, top_y + h)
             
-            blur_R = 1
+            blur_R = 5
             mask = torch.ones((1, 1, H_per_f, W_per_f), device=device, dtype=self.dtype)
 
             # Conservative valid image ranges
@@ -419,23 +419,16 @@ class ModelViz(ToolbarViewer):
             bot_y = bot_y - blur_R if bot_y < H_per_f else bot_y
             rig_x = rig_x - blur_R if rig_x < W_per_f else rig_x
             mask[:, :, top_y:bot_y, lef_x:rig_x] = 0
-
-            draw_debug(img_chw=mask[0])
             
             # Blur mask to reduce sharp transition
             if blur_R > 0:    
-                gauss_kernel = torch.tensor([
-                    [1, 2, 1],
-                    [2, 4, 2],
-                    [1, 2, 1],
-                ], dtype=mask.dtype, device=mask.device).view(1, 1, 3, 3)
-                gauss_kernel /= gauss_kernel.sum()
-                assert blur_R == 1, 'Not implemented'
-                conv = torch.nn.Conv2d(3, 3, 3, paddimg=1, padding_mode='border')
-                conv.weight = gauss_kernel # [out_ch, in_ch/groups, kernel_size[0], kernel_size[1]]
-                raise RuntimeError('FIX')
-                #mask = conv(mask, gauss_kernel, padding=1).clip(0, 1)
-                draw_debug(img_chw=mask[0])
+                from scipy.ndimage import gaussian_filter
+                dirac = np.diag([0.0]*blur_R + [1.0] + [0.0]*blur_R)
+                gauss_kernel = gaussian_filter(dirac, sigma=1)
+                conv = torch.nn.Conv2d(1, 1, kernel_size=2*blur_R+1, padding='same', padding_mode='replicate', bias=False)
+                conv.weight.data = torch.tensor(gauss_kernel, device=device, dtype=self.dtype).view(1, 1, *dirac.shape)
+                mask = conv(mask).clip(0, 1)
+                #draw_debug(img_chw=mask[0])
             
             self.rend.cond_img_mask = mask
 
