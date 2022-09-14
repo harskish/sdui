@@ -40,7 +40,7 @@ from ldm.modules.encoders.modules import get_default_device_type
 from ldm.modules import attention
 from viewer.single_image_viewer import draw as draw_debug
 
-SAMPLERS_IMG2IMG = ['k_dpm_2_a', 'k_dpm_2', 'k_euler_a', 'k_euler', 'k_heun', 'k_lms']
+SAMPLERS_IMG2IMG = ['k_euler', 'k_euler_a', 'k_heun', 'k_lms', 'k_dpm_2', 'k_dpm_2_a']
 SAMPLERS_ALL = SAMPLERS_IMG2IMG + ['ddim', 'plms']
 
 # Suppress CLIP warning
@@ -441,7 +441,7 @@ class ModelViz(ToolbarViewer):
         with (self.state_lock if need_lock else nullcontext()):
             # Not all samplers support img2img
             if self.state.sampler_type not in SAMPLERS_IMG2IMG:
-                self.state.sampler_type = 'ddim'
+                self.state.sampler_type = 'k_euler'
             self.state.H = H_per_f * self.state.f
             self.state.W = W_per_f * self.state.f
             self.state.image_cond = arr_to_b64(init_latent.cpu().numpy().astype(np.float16))
