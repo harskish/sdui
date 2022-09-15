@@ -187,12 +187,7 @@ def get_act_shape(state):
 @lru_cache()
 def get_model(pkl, use_half):
     config = OmegaConf.load('configs/stable-diffusion/v1-inference.yaml')
-    
-    #print(config['model']['params']['first_stage_config'])
-    #print(config['model']['params']['unet_config'])
-    #print(config['model']['params']['cond_stage_config'])
     config['model']['params']['unet_config']['params']['use_fp16'] = use_half
-    
     model = load_model_from_config(config, pkl, use_half)
     
     # Does not seem to support float16
@@ -384,6 +379,16 @@ class ModelViz(ToolbarViewer):
         w, h = image.size # potentially changed
         top_left = ((W - w) // 2, (H - h) // 2)
         canvas.paste(image, top_left)
+
+        # Reverse sampling test
+        # if isinstance(self.rend.sampler, KDiffusionSampler) and self.rend.sampler.schedule == 'euler':
+        #     T = 50
+        #     xT = self.rend.sampler.reverse(self.rend.model, image, '', T, device=device, dtype=self.dtype)
+        #     c = self.rend.model.get_learned_conditioning(['']).to(self.dtype)
+        #     x0, _ = self.rend.sampler.sample_general(T, 0, c, 0.5, None, xT)
+        #     img_rec = self.rend.model.decode_first_stage(x0)
+        #     img_rec = torch.clamp((img_rec + 1.0) / 2.0, min=0.0, max=1.0) # [1, 3, 512, 512]
+        #     draw_debug(img_chw=img_rec[0])
 
         np_img = np.array(canvas).astype(np.float32) / 255.0
         np_img = np_img[None].transpose(0, 3, 1, 2)

@@ -132,3 +132,23 @@ class KDiffusionSampler:
             extra_args={'cond': cond, 'uncond': unconditional_conditioning, 'cond_scale': unconditional_guidance_scale, 'mask': mask, 'x0': x0}) #'xi': xi
 
         return samples_ddim
+
+    # Find noise that recovers input image
+    def reverse(self, model, img, prompt='', steps=50, device='cuda', dtype=torch.float16):
+        if self.schedule != 'euler':
+            raise NotImplementedError('Reverse mode only implemented for k_euler')
+
+        """
+        https://www.reddit.com/r/StableDiffusion/comments/xboy90/a_better_way_of_doing_img2img_by_finding_the/
+        https://github.com/AUTOMATIC1111/stable-diffusion-webui/issues/291
+        https://github.com/AUTOMATIC1111/stable-diffusion-webui/commit/9c48383608850a1e151985e814a593291a69196b:
+        - use Euler only
+        - recommended: 50 steps, low cfg scale between 1 and 2
+        - denoising and seed don't matter
+        - decode cfg scale between 0 and 1
+        - decode steps 50
+        - original blue haired woman close nearly reproduces with cfg scale=1.8
+        """
+        xT = K.reverse.find_noise_for_image(model, img, prompt, steps, cond_scale=1.5, verbose=False, normalize=False, device=device, dtype=dtype)
+        return xT / xT.std()
+
