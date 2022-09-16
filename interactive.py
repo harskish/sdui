@@ -27,6 +27,7 @@ from PIL.PngImagePlugin import PngInfo, PngImageFile
 from pytorch_lightning import seed_everything
 from multiprocessing import Lock
 import json
+import zlib
 from PIL import Image
 
 from mps_patches import apply_mps_patches
@@ -107,16 +108,27 @@ def seeds_to_samples(seeds, shape=(1, 512)):
     return torch.tensor(latents)
 
 # FP16: float list ~6x larger than base64-encoded one when json-serialized
-def arr_to_b64(arr: np.ndarray):
+# Header: {compressed?},{ndim},{shape0}(,{shape1},...),{data}
+def arr_to_b64(arr: np.ndarray, compress=True):
+    header = f'{"c" if compress else "u"},{arr.ndim},' + ','.join(map(str, arr.shape))
     arr = arr.astype(np.dtype(arr.dtype).newbyteorder('<')) # convert to little-endian
-    b64_str = b64encode(arr.reshape(-1).tobytes()).decode('ascii') # little-endian bytes to base64 str
-    return b64_str
+    arr_bytes = zlib.compress(arr.tobytes()) if compress else arr.tobytes()
+    b64_str = b64encode(arr_bytes).decode('ascii') # little-endian bytes to base64 str
+    return header + ',' + b64_str
+
+def b64_parse_header(s: str):
+    mode, ndim, s = s.split(',', maxsplit=2)
+    *shape, s = s.split(',', maxsplit=int(ndim))
+    shape = tuple(int(v) for v in shape)
+    return mode, shape, s
 
 def b64_to_arr(s: str, dtype: np.dtype):
-    dtype = np.dtype(dtype).newbyteorder('<') # incoming data is little-endian
+    mode, shape, s = b64_parse_header(s)
     buffer = b64decode(s.encode('ascii'))
-    elems = len(buffer) // dtype.itemsize
-    recovered = np.ndarray(shape=elems, dtype=dtype, buffer=buffer)
+    if mode == 'c':
+        buffer = zlib.decompress(buffer)
+    dtype = np.dtype(dtype).newbyteorder('<') # incoming data is little-endian
+    recovered = np.ndarray(shape=shape, dtype=dtype, buffer=buffer)
     return recovered.astype(dtype.newbyteorder('=')) # to native byte order
 
 # Hash string into uint32
@@ -182,7 +194,7 @@ def load_model_from_config(config, ckpt, use_half=False, verbose=False):
     return model
 
 def get_act_shape(state):
-    return [state.C, state.H // state.f, state.W // state.f]
+    return (state.C, state.H // state.f, state.W // state.f)
 
 @lru_cache()
 def get_model(pkl, use_half):
@@ -285,15 +297,14 @@ class ModelViz(ToolbarViewer):
     def reshape_image_cond(self, need_lock=True):
         if self.state.image_cond is None:
             return
-        
+
         # Original not available, cannot rescale
         if self.rend.cond_img_orig is None:
-            # https://stackoverflow.com/a/31179482
-            n_bytes = (len(self.state.image_cond) * 3) // 4 - self.state.image_cond.count('=', -2)
-            n_elems_fp16 = n_bytes // 2
-            if n_elems_fp16 != np.prod(get_act_shape(self.state)):
-                print('Image conditioning shape not compatible, removing...')
+            shape = b64_parse_header(self.state.image_cond)[1]
+            if shape[1:] != get_act_shape(self.state):
+                print('Image conditioning shape incompatible, removing...')
                 self.state.image_cond = None
+                self.state.image_cond_mask = None
         else:
             # Adapt image to current shape
             self.get_cond_from_img(self.rend.cond_img_orig, self.state.image_cond_scale_mode, need_lock=need_lock)
@@ -315,12 +326,21 @@ class ModelViz(ToolbarViewer):
         for k, v in state_dict_soft.items():
             setattr(self.state_soft, k, v)
 
-        # Convert old-style image-cond
-        if isinstance(self.state.image_cond, list):
-            self.state.image_cond = arr_to_b64(np.array(self.state.image_cond).astype(np.float16))
+        # Convert old-style image-conds
+        cond = self.state.image_cond
+        if isinstance(cond, list):
+            self.state.image_cond = arr_to_b64(np.array(cond).astype(np.float16).reshape(1, *get_act_shape(self.state)))
+        elif isinstance(cond, str) and cond[0] not in ['c', 'u']:
+            C, H, W = get_act_shape(self.state)
+            self.state.image_cond = f'u,4,1,{C},{H},{W},{cond}'
         
-        # If updating image conditioning: invalidate preview image
-        if 'image_cond' in state_dict:
+        # Remove old mask
+        if state_dict.get('image_cond_mask') is None:
+            self.state.image_cond_mask = None
+
+        # Cond from meta: no original available
+        if state_dict.get('image_cond') is not None:
+            self.rend.cond_img_orig = None
             self.rend.cond_img_handle = None
 
         self.state_lock.release()
@@ -380,16 +400,6 @@ class ModelViz(ToolbarViewer):
         top_left = ((W - w) // 2, (H - h) // 2)
         canvas.paste(image, top_left)
 
-        # Reverse sampling test
-        # if isinstance(self.rend.sampler, KDiffusionSampler) and self.rend.sampler.schedule == 'euler':
-        #     T = 50
-        #     xT = self.rend.sampler.reverse(self.rend.model, image, '', T, device=device, dtype=self.dtype)
-        #     c = self.rend.model.get_learned_conditioning(['']).to(self.dtype)
-        #     x0, _ = self.rend.sampler.sample_general(T, 0, c, 0.5, None, xT)
-        #     img_rec = self.rend.model.decode_first_stage(x0)
-        #     img_rec = torch.clamp((img_rec + 1.0) / 2.0, min=0.0, max=1.0) # [1, 3, 512, 512]
-        #     draw_debug(img_chw=img_rec[0])
-
         np_img = np.array(canvas).astype(np.float32) / 255.0
         np_img = np_img[None].transpose(0, 3, 1, 2)
         init_image = 2 * torch.tensor(np_img.copy()).to(self.dtype).to(device) - 1
@@ -404,6 +414,7 @@ class ModelViz(ToolbarViewer):
         assert C == self.state.C, 'C does not match'
 
         # Set mask if needed
+        mask = None
         if w < W or h < H:
             lef_x, top_y = top_left
             rig_x, bot_y = (lef_x + w, top_y + h)
@@ -433,14 +444,10 @@ class ModelViz(ToolbarViewer):
                 conv.weight.data = torch.tensor(gauss_kernel, device=device, dtype=self.dtype).view(1, 1, *dirac.shape)
                 mask = conv(mask).clip(0, 1)
                 #draw_debug(img_chw=mask[0])
-            
-            self.rend.cond_img_mask = mask
 
             # Use random init for outside parts
             # Not needed? This is the final latent which is noised anyway later
             #init_latent = mask * init_latent + (1 - mask) * torch.randn_like(init_latent) * encoded.std * self.rend.model.scale_factor
-        else:
-            self.rend.cond_img_mask = None
         
         # Make sure state consistent
         with (self.state_lock if need_lock else nullcontext()):
@@ -450,6 +457,7 @@ class ModelViz(ToolbarViewer):
             self.state.H = H_per_f * self.state.f
             self.state.W = W_per_f * self.state.f
             self.state.image_cond = arr_to_b64(init_latent.cpu().numpy().astype(np.float16))
+            self.state.image_cond_mask = None if mask is None else arr_to_b64(np.uint8(255*mask.cpu().numpy()))
 
             # For faster hashing of state
             self.state.image_cond_hash = hashlib.sha1(np_img.tobytes()).hexdigest()
@@ -539,15 +547,11 @@ class ModelViz(ToolbarViewer):
                     self.v.upload_image(self.output_key, grid)
                     H, W, C = grid.shape
                     self.img_shape = (C, H, W)
-            
-            # TODO: need to seed whole diffusion process, not just initial rand
-            seeds = [s.seed + i for i in range(s.B)]
-            xT = seeds_to_samples(seeds, (len(seeds), *shape)).to(self.dtype).to(device)
 
             t_img2img = 0
-            x0 = None
+            x0 = xT = None
             if s.image_cond is not None:
-                x0_np = b64_to_arr(s.image_cond, np.float16).reshape([1, *shape])
+                x0_np = b64_to_arr(s.image_cond, np.float16)
                 x0 = torch.tensor(x0_np, device=device).repeat((s.B, 1, 1, 1)).to(self.dtype)
                 strength = 1 - (s.image_cond_strength - 1) / 10 # [1, 10] => [0, 9] => [1.0, 0.1]
                 t_img2img = int(strength * s.T)
@@ -557,16 +561,19 @@ class ModelViz(ToolbarViewer):
                 # TODO: need to seed whole diffusion process, not just initial rand
                 base = djb2_hash(s.image_cond_hash) # hash loaded from state dump => deterministic
                 seeds = [(base + s.seed + i) % (1<<32-1) for i in range(s.B)]
-                xT = seeds_to_samples(seeds, (len(seeds), *shape)).to(device).to(self.dtype)
+                xT = seeds_to_samples(seeds, (len(seeds), *shape)).to(self.dtype).to(device)
+            else:
+                seeds = [s.seed + i for i in range(s.B)]
+                xT = seeds_to_samples(seeds, (len(seeds), *shape)).to(self.dtype).to(device)
+
+            mask = None
+            if s.image_cond_mask is not None:
+                mask_uint8 = b64_to_arr(s.image_cond_mask, dtype=np.uint8)
+                mask = torch.tensor(mask_uint8 / 255.0, dtype=self.dtype, device=device)
             
             seed_everything(s.seed)
 
-            if self.state.sampler_type not in SAMPLERS_IMG2IMG:
-                # txt2img on ddim/plms
-                self.rend.sampler.sample(S=s.T, conditioning=c, batch_size=s.B,
-                    shape=shape, verbose=False, unconditional_guidance_scale=s.guidance_scale,
-                    unconditional_conditioning=uc, eta=0.0, x_T=xT, img_callback=cbk_img)
-            else:
+            if isinstance(self.rend.sampler, KDiffusionSampler):
                 # txt2img, img2img or mixed, k-samplers
                 out, _ = self.rend.sampler.sample_general(
                     steps_tot=s.T,
@@ -576,10 +583,15 @@ class ModelViz(ToolbarViewer):
                     uc=uc,
                     x_T=xT,
                     x0=x0,
-                    mask=self.rend.cond_img_mask,
+                    mask=mask,
                     img_callback=cbk_img
                 )
                 cbk_img(out, s.T - 1)
+            else:
+                # txt2img on ddim/plms
+                self.rend.sampler.sample(S=s.T, conditioning=c, batch_size=s.B,
+                    shape=shape, verbose=False, unconditional_guidance_scale=s.guidance_scale,
+                    unconditional_conditioning=uc, eta=0.0, x_T=xT, img_callback=cbk_img)
         except UserAbort:
             # UI state changed, restart rendering
             return None
@@ -648,8 +660,8 @@ class ModelViz(ToolbarViewer):
                 with self.state_lock:
                     self.rend.cond_img_handle = None
                     self.rend.cond_img_orig = None
-                    self.rend.cond_img_mask = None
                     s.image_cond = None
+                    s.image_cond_mask = None
                     s.image_cond_hash = None
             imgui.same_line()
         if imgui.button('Use current'):
@@ -673,6 +685,7 @@ class UIState:
     guidance_scale: float = 8.0 # classifier guidance
     sampler_type: str = 'k_euler'
     image_cond: str = None
+    image_cond_mask: str = None
     image_cond_strength: float = 7.0 # [0, 10]
     image_cond_hash: str = None
     image_cond_scale_mode: str = 'fit' # center, stretch
@@ -695,7 +708,6 @@ class RendererState:
     intermed: torch.Tensor = None
     cond_img_handle: str = None # handle to GL texture of conditioning img
     cond_img_orig: Image = None # original conditioning image
-    cond_img_mask: torch.Tensor = None
     img_cache: Dict[str, torch.Tensor] = None
     cond_cache: Dict[Tuple[str, float], Tuple[torch.Tensor, torch.Tensor]] = None
     i: int = 0 # current computation progress
