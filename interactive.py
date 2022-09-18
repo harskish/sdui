@@ -1,6 +1,8 @@
 import os
 #os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'max_split_size_mb:128'
 
+# TODO: https://www.photoroom.com/tech/stable-diffusion-25-percent-faster-and-save-seconds/
+
 import torch
 import imgui
 import numpy as np
