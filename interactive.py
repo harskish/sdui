@@ -46,6 +46,10 @@ from viewer.single_image_viewer import draw as draw_debug
 SAMPLERS_IMG2IMG = ['k_euler', 'k_euler_a', 'k_heun', 'k_lms', 'k_dpm_2', 'k_dpm_2_a']
 SAMPLERS_ALL = SAMPLERS_IMG2IMG + ['ddim', 'plms']
 
+# For checking sate dump compatibility
+# Only bumped on breaking changes
+STATE_VERSION = '2022/09/20'
+
 # Suppress CLIP warning
 import transformers
 transformers.logging.set_verbosity_error()
@@ -97,17 +101,15 @@ def sample_seeds(N, base=None):
         base = np.random.randint(np.iinfo(np.int32).max - N)
     return [(base + s) for s in range(N)]
 
-def sample_normal(shape=(1, 512), seed=None):
-    seeds = sample_seeds(shape[0], base=seed)
-    return seeds_to_samples(seeds, shape)
-
-def seeds_to_samples(seeds, shape=(1, 512)):
-    latents = np.zeros(shape, dtype=np.float32)
-    for i, seed in enumerate(seeds):
-        rng = np.random.RandomState(seed)
-        latents[i] = rng.standard_normal(shape[1:])
+def seeds_to_samples(seeds, shape=(1, 512), dtype=torch.float32):
+    latents = torch.empty((len(seeds), *shape), dtype=dtype)
+    g = torch.Generator('cpu')
     
-    return torch.tensor(latents)
+    for i, seed in enumerate(seeds):
+        g.manual_seed(seed)
+        latents[i] = torch.randn(shape, generator=g).to(dtype) # generation ~5x faster in float32
+
+    return latents
 
 # FP16: float list ~6x larger than base64-encoded one when json-serialized
 # Header: {compressed?},{ndim},{shape0}(,{shape1},...),{data}
@@ -285,6 +287,7 @@ class ModelViz(ToolbarViewer):
         return {
             'state': asdict(self.state),
             'state_soft': asdict(self.state_soft),
+            'version': STATE_VERSION,
         }
 
     def load_state_from_img(self, path):
@@ -316,6 +319,11 @@ class ModelViz(ToolbarViewer):
 
         state_dict = state_dict_in['state']
         state_dict_soft = state_dict_in['state_soft']
+
+        # Check version
+        dump_ver = state_dict_in.get('version', '<initial release>')
+        if dump_ver != STATE_VERSION:
+            print(f'\nWARNING: state dump version ({dump_ver}) incompatible with source code version ({STATE_VERSION}), output might look different.\n')
         
         # Ignore certain values
         ignores = ['fp16']
@@ -477,6 +485,19 @@ class ModelViz(ToolbarViewer):
         self.rend.cond_img_orig = img
         self.get_cond_from_img(img, self.state.image_cond_scale_mode)
 
+    @lru_cache(maxsize=5)
+    def _get_rand_canvas(self, seeds, shape, dtype):
+        return seeds_to_samples(seeds, shape=shape, dtype=dtype)
+    
+    # Draw spatial latents from a large underlying canvas
+    # => resolution changes affects content less
+    def sample_latent(self, seeds, C, H, W, dtype):
+        max_W = max_H = 500  # corresponds to 4k image (given f=8)
+        assert W <= max_W and H <= max_H, 'Maximum canvas size exceeded'
+        canvas = self._get_rand_canvas(seeds, shape=(C, max_H, max_W), dtype=dtype)
+        tl_x, tl_y = (max_W//2-W//2, max_H//2-H//2)
+        return canvas[:, :, tl_y:tl_y+H, tl_x:tl_x+W]
+
     def compute(self):
         # Copy for this frame
         with self.state_lock:
@@ -560,13 +581,12 @@ class ModelViz(ToolbarViewer):
                 
                 # Image suffers if using same noise in encode and cond image generation
                 # => make sure sequences differ
-                # TODO: need to seed whole diffusion process, not just initial rand
                 base = djb2_hash(s.image_cond_hash) # hash loaded from state dump => deterministic
-                seeds = [(base + s.seed + i) % (1<<32-1) for i in range(s.B)]
-                xT = seeds_to_samples(seeds, (len(seeds), *shape)).to(self.dtype).to(device)
+                seeds = tuple((base + s.seed + i) % (1<<32-1) for i in range(s.B))
+                xT = self.sample_latent(seeds, *shape, self.dtype).to(device)
             else:
-                seeds = [s.seed + i for i in range(s.B)]
-                xT = seeds_to_samples(seeds, (len(seeds), *shape)).to(self.dtype).to(device)
+                seeds = tuple(s.seed + i for i in range(s.B))
+                xT = self.sample_latent(seeds, *shape, self.dtype).to(device)
 
             mask = None
             if s.image_cond_mask is not None:
