@@ -10,6 +10,7 @@ dependencies:
     - clean-fid
     - resize-right
     - torchdiffeq
+    - protobuf==3.20.1
     - whl/torch-1.13.0a0+gitc9f7557-cp310-cp310-macosx_12_0_arm64.whl
     - torchvision
     - imgui[glfw]==1.4
