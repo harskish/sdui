@@ -16,6 +16,14 @@
             ]
         },
         {
+            "name": "Compression test",
+            "type": "python",
+            "request": "launch",
+            "program": "${workspaceFolder}/stable_diffusion_based_lossy_image_compression.py",
+            "console": "integratedTerminal",
+            "justMyCode": false,
+        },
+        {
             "name": "Sample",
             "type": "python",
             "request": "launch",

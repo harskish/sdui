@@ -13,7 +13,7 @@ from contextlib import contextmanager
 
 import imgui.core
 from imgui.integrations.glfw import GlfwRenderer
-from imgui_themes import theme_dark_overshifted, theme_deep_dark, theme_ps, theme_contrast
+from . imgui_themes import theme_dark_overshifted, theme_deep_dark, theme_ps, theme_contrast
 
 import glfw
 glfw.ERROR_REPORTING = 'raise' # make sure errors don't get swallowed
