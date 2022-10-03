@@ -1,9 +1,9 @@
 import os
-#os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'max_split_size_mb:128'
 
 # TODOs:
-# https://github.com/huggingface/diffusers/pull/532  # Flash Attention
-# https://www.photoroom.com/tech/stable-diffusion-25-percent-faster-and-save-seconds/  # TensorRT
+# https://github.com/huggingface/diffusers/pull/532 # Flash Attention
+# https://www.photoroom.com/tech/stable-diffusion-25-percent-faster-and-save-seconds/ # TensorRT
+# https://github.com/facebookincubator/AITemplate/tree/main/examples/05_stable_diffusion # AITemplate
 
 import torch
 import imgui
