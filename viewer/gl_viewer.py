@@ -184,6 +184,7 @@ class viewer:
         self._images = {}
         self._editables = {}
         self.tex_interp_mode = gl.GL_LINEAR
+        self.default_font_size = 15
         
         fname = inifile or "".join(c for c in title.lower() if c.isalnum())
         self._inifile = Path(fname).with_suffix('.ini')
@@ -247,8 +248,15 @@ class viewer:
         # TERO
         self._imgui_context = imgui.create_context()
         font = self.get_default_font()
-        font_sizes = {int(size) for size in range(8, 36, 2)} # Apple M1 has limit on GL textures
-        self._imgui_fonts = {size: imgui.get_io().fonts.add_font_from_file_ttf(font, size, imgui.get_io().fonts.get_glyph_ranges_chinese_full()) for size in font_sizes}
+
+        # MPLUSRounded1c-Medium.tff: no content for sizes >35
+        font_sizes = range(8, 36, 2) if 'darwin' in platform else range(8, 36, 1) # Apple M1 has limit on GL texture count
+        font_sizes = [int(s) for s in font_sizes]
+        handle = imgui.get_io().fonts
+        self._imgui_fonts = {
+            size: handle.add_font_from_file_ttf(font, size,
+                glyph_ranges=handle.get_glyph_ranges_chinese_full()) for size in font_sizes
+        }
 
         self._context_lock = mp.Lock()
         self._context_tid = None # id of thread in critical section
@@ -287,8 +295,9 @@ class viewer:
 
     # Scales fonts and sliders/etc
     def set_ui_scale(self, scale):
-        self.set_font_size(15*scale)
-        self.ui_scale = self.font_size / 15
+        k = self.default_font_size
+        self.set_font_size(k*scale)
+        self.ui_scale = self.font_size / k
 
     def set_interp_linear(self, update_existing=True):
         if update_existing:

@@ -159,7 +159,9 @@ class ToolbarViewer:
             if not self.ui_locked:
                 imgui.same_line(position=imgui.get_window_width()-300-25*s)
                 with imgui_item_width(300): # size not dependent on s => prevents slider drift
-                    ch, val = imgui.slider_float('', s, 0.5, 2.0)
+                    max_scale = max(self.v._imgui_fonts.keys()) / self.v.default_font_size
+                    min_scale = min(self.v._imgui_fonts.keys()) / self.v.default_font_size
+                    ch, val = imgui.slider_float('', s, min_scale, max_scale)
                 if ch:
                     self.v.set_ui_scale(val)
 
