@@ -4,6 +4,7 @@ import os
 # https://github.com/huggingface/diffusers/pull/532 # Flash Attention
 # https://www.photoroom.com/tech/stable-diffusion-25-percent-faster-and-save-seconds/ # TensorRT
 # https://github.com/facebookincubator/AITemplate/tree/main/examples/05_stable_diffusion # AITemplate
+# https://github.com/HazyResearch/diffusers/commit/fd45ca2afb26d013e954ccbeba8b639c4783b270 # FlashAttention (again?)
 
 import torch
 import imgui
