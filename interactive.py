@@ -14,8 +14,8 @@ from sys import exit
 from dataclasses import dataclass
 from copy import deepcopy
 from functools import lru_cache
-from viewer.toolbar_viewer import ToolbarViewer
-from viewer.utils import reshape_grid, combo_box_vals
+from pyviewer.toolbar_viewer import ToolbarViewer
+from pyviewer.utils import reshape_grid, combo_box_vals
 from typing import Dict, Tuple, Union, List
 from os import makedirs
 from dataclasses import asdict
@@ -23,7 +23,6 @@ from contextlib import nullcontext
 from base64 import b64encode, b64decode
 from pathlib import Path
 from glfw import KEY_LEFT_SHIFT
-from torch.nn.functional import conv2d
 import gdown
 import glfw
 import hashlib
@@ -44,7 +43,7 @@ from ldm.models.diffusion.k_samplers import KDiffusionSampler
 from ldm.models.diffusion.ddpm import LatentDiffusion
 from ldm.modules.encoders.modules import get_default_device_type
 from ldm.modules import attention
-from viewer.single_image_viewer import draw as draw_debug
+from pyviewer.single_image_viewer import draw as draw_debug
 
 SAMPLERS_IMG2IMG = ['k_euler', 'k_euler_a', 'k_heun', 'k_lms', 'k_dpm_2', 'k_dpm_2_a']
 SAMPLERS_ALL = SAMPLERS_IMG2IMG + ['ddim', 'plms']
