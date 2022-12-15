@@ -1,0 +1,19 @@
+name: sdui
+channels:
+  - defaults
+dependencies:
+  - python=3.9
+  - pip=22.3
+  - pip:
+    - --extra-index-url https://download.pytorch.org/whl/cu116
+    - torch==1.13.1+cu116; platform_system != "darwin"
+    - torch==1.13.*; platform_system == "darwin"
+    - ninja==1.11.*
+    - transformers==4.25.*
+    - accelerate==0.15.*
+    - scipy==1.9.*
+    - diffusers[torch]==0.10.2
+    - gdown
+    - -e git+https://github.com/harskish/pyviewer.git#egg=pyviewer
+
+# conda env create --force --file environment.yaml

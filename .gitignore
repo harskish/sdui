@@ -5,3 +5,4 @@
 outputs/
 src/
 .vscode/settings.json
+*.egg-info
