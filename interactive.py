@@ -34,15 +34,24 @@ import json
 import zlib
 from PIL import Image
 
+# No phoning home on my watch
+os.environ['TRANSFORMERS_OFFLINE'] = '1'
+os.environ['HF_DATASETS_OFFLINE'] = '1'
+os.environ['HF_HUB_OFFLINE'] = '1' # ignored...
+os.environ['DISABLE_TELEMETRY'] = '1' # ignored...
+from diffusers import StableDiffusionPipeline, DPMSolverMultistepScheduler, hub_utils, __version__ as diff_ver
+hub_utils.HUGGINGFACE_CO_TELEMETRY = 'dummy'
+assert diff_ver == '0.10.2', 'Version changed, check logic above'
+
 from mps_patches import apply_mps_patches
-from omegaconf import OmegaConf
-from ldm.util import instantiate_from_config
+#from omegaconf import OmegaConf
+#from ldm.util import instantiate_from_config
 from ldm.models.diffusion.ddim import DDIMSampler
 from ldm.models.diffusion.plms import PLMSSampler
 from ldm.models.diffusion.k_samplers import KDiffusionSampler
-from ldm.models.diffusion.ddpm import LatentDiffusion
+#from ldm.models.diffusion.ddpm import LatentDiffusion
 from ldm.modules.encoders.modules import get_default_device_type
-from ldm.modules import attention
+#from ldm.modules import attention
 from pyviewer.single_image_viewer import draw as draw_debug
 
 SAMPLERS_IMG2IMG = ['k_euler', 'k_euler_a', 'k_heun', 'k_lms', 'k_dpm_2', 'k_dpm_2_a']
@@ -50,7 +59,9 @@ SAMPLERS_ALL = SAMPLERS_IMG2IMG + ['ddim', 'plms']
 
 # For checking sate dump compatibility
 # Only bumped on breaking changes
-STATE_VERSION = '2022/09/20'
+STATE_VERSION = '2022/12/14'
+
+model_path: str = None
 
 # Suppress CLIP warning
 import transformers
@@ -66,8 +77,8 @@ GroupNorm32.forward = forward
 
 # Choose backend
 device = get_default_device_type()
-if device == 'mps':
-    apply_mps_patches()
+#if device == 'mps':
+#    apply_mps_patches()
 
 def file_drop_callback(window, paths, viewer):
     # imgui.get_mouse_pose() sometimes returns -1...
@@ -151,10 +162,11 @@ def slider_dynamic(title, v, min, max):
     return imgui.slider_float(title, v, min, max, format=scale_fmt)
 
 def download_weights():
-    id = '1F8R6C_63mM49vjYRoaAgMTtHRrwX3YhZ' # sd-v1-4.ckpt
-    trg = Path('models/ldm/stable-diffusion-v1/model.ckpt')
-    if trg.is_file():
-        return
+    id = '1slFRZAc2VMzpsX2qIsRhcyubhY6RGkyl' # folder: diffusers/1.4-fp16
+    trg = Path('models/ldm/stable-diffusion-v1/diffusers/1.4-fp16')
+    marker = trg / '.done'
+    if marker.is_file():
+        return trg
 
     resp = None
     while resp not in ['yes', 'y', 'no', 'n']:
@@ -169,49 +181,33 @@ def download_weights():
         exit(-1)
 
     makedirs(trg.parent, exist_ok=True)
-    gdown.download(id=id, output=str(trg), quiet=False)
-    assert trg.is_file(), 'DL failed!'
+    gdown.download_folder(id=id, output=str(trg), quiet=False)
+    assert trg.is_dir(), 'DL failed!'
+    marker.touch()
 
-def load_model_from_config(config, ckpt, use_half=False, verbose=False):
-    print(f'Loading model from {ckpt}')
-    pl_sd = torch.load(ckpt, map_location='cpu')
-    sd = pl_sd['state_dict']
-    model = instantiate_from_config(config.model)
-    setattr(model, 'ckpt', ckpt)
-    m, u = model.load_state_dict(sd, strict=False)
-    if len(m) > 0 and verbose:
-        print('missing keys:')
-        print(m)
-    if len(u) > 0 and verbose:
-        print('unexpected keys:')
-        print(u)
-
-    if use_half:
-        model.half()
-
-    model.to(device)
-    model.eval()
-
-    # Switch to EMA weights
-    if model.use_ema:
-        model.model_ema.store(model.model.parameters())
-        model.model_ema.copy_to(model.model)
-    
-    return model
+    return trg
 
 def get_act_shape(state):
     return (state.C, state.H // state.f, state.W // state.f)
 
 @lru_cache()
-def get_model(pkl, use_half):
-    config = OmegaConf.load('configs/stable-diffusion/v1-inference.yaml')
-    config['model']['params']['unet_config']['params']['use_fp16'] = use_half
-    model = load_model_from_config(config, pkl, use_half)
-    
-    # Does not seem to support float16
-    model.cond_stage_model.float()
+def get_model(model_path, use_half):
+    model_path = "stabilityai/stable-diffusion-2-1"
 
-    return model
+    pipe = StableDiffusionPipeline.from_pretrained(
+        model_path,
+        torch_dtype=torch.float32, #torch.float16 if use_half else torch.float32,
+        #local_files_only=True,
+    )
+    pipe.scheduler = DPMSolverMultistepScheduler.from_config(pipe.scheduler.config)
+    pipe = pipe.to(device)
+
+    prompt = "a photo of an astronaut riding a horse on mars"
+    image = pipe(prompt).images[0]
+        
+    image.save("astronaut_rides_horse.png")
+
+    return pipe
 
 class ModelViz(ToolbarViewer):    
     def __init__(self, name, input=None):
@@ -273,8 +269,8 @@ class ModelViz(ToolbarViewer):
         else:
             raise RuntimeError('Unknown sampler type')
 
-    def init_model(self, pkl) -> LatentDiffusion:
-        model = get_model(pkl, self.state.fp16)
+    def init_model(self, model_path) -> StableDiffusionPipeline:
+        model = get_model(model_path, self.state.fp16)
 
         # Reset caches
         prev = self.rend.model
@@ -360,10 +356,9 @@ class ModelViz(ToolbarViewer):
 
     # After init or state load
     def post_init(self):
-        self.state_soft.attn_group_size = attention.ATTN_GROUP_SIZE = \
-            min(attention.ATTN_GROUP_SIZE, self.state_soft.attn_group_size)
         self.reshape_image_cond()
         self.prompt_curr = self.state.prompt
+        self.state.model_path = str(model_path)
 
     def export_img(self):
         grid = reshape_grid(self.rend.intermed).contiguous() # HWC
@@ -513,7 +508,7 @@ class ModelViz(ToolbarViewer):
         # Only works for fields annotated with type (e.g. sliders: list)
         if self.rend.last_ui_state != s:
             self.rend.last_ui_state = s
-            self.rend.model = self.init_model(s.pkl)
+            self.rend.model = self.init_model(s.model_path)
             self.rend.sampler = self.init_sampler(self.rend.model)
             self.rend.i = 0
             self.rend.intermed = torch.zeros(s.B, 3, s.H, s.W, device=device, dtype=self.dtype)
@@ -652,12 +647,12 @@ class ModelViz(ToolbarViewer):
         #self.state_lock.release()
         
         # Speed-VRAM tradeoff, larger = faster
-        ch, self.state_soft.attn_group_size = combo_box_vals('Attn. group size', [2, 4, 8, 16], self.state_soft.attn_group_size)
-        if imgui.is_item_hovered():
-            imgui.set_tooltip('Attention group size, smaller values reduce VRAM requirement at the cost of speed')
-        if ch:
-            torch.cuda.empty_cache()
-            attention.ATTN_GROUP_SIZE = self.state_soft.attn_group_size
+        # ch, self.state_soft.attn_group_size = combo_box_vals('Attn. group size', [2, 4, 8, 16], self.state_soft.attn_group_size)
+        # if imgui.is_item_hovered():
+        #     imgui.set_tooltip('Attention group size, smaller values reduce VRAM requirement at the cost of speed')
+        # if ch:
+        #     torch.cuda.empty_cache()
+        #     attention.ATTN_GROUP_SIZE = self.state_soft.attn_group_size
 
         s.sampler_type = combo_box_vals('Sampler', SAMPLERS_ALL if s.image_cond is None else SAMPLERS_IMG2IMG, s.sampler_type)[1]
         s.guidance_scale = slider_dynamic('Guidance', s.guidance_scale, 0, 20)[1]
@@ -697,7 +692,7 @@ class ModelViz(ToolbarViewer):
 # Volatile state: requires recomputation of results
 @dataclass
 class UIState:
-    pkl: str = 'models/ldm/stable-diffusion-v1/model.ckpt'
+    model_path: str = None
     T: int = 35
     seed: int = 0
     B: int = 1
@@ -727,8 +722,8 @@ class UIStateSoft:
 @dataclass
 class RendererState:
     last_ui_state: UIState = None # Detect changes in UI, restart rendering
-    model: LatentDiffusion = None
-    sampler: Union[PLMSSampler, DDIMSampler] = None
+    model: StableDiffusionPipeline = None
+    sampler: Union[PLMSSampler, DDIMSampler, KDiffusionSampler] = None
     intermed: torch.Tensor = None
     cond_img_handle: str = None # handle to GL texture of conditioning img
     cond_img_orig: Image = None # original conditioning image
@@ -752,7 +747,7 @@ if __name__ == '__main__':
     parser.add_argument('input', type=str, nargs='?', default=None, help='Image to load state from')
     args = parser.parse_args()
     
-    download_weights()
+    model_path = download_weights() # global
     init_torch()
     viewer = ModelViz('sdui', input=args.input)
     print('Done')
