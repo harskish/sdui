@@ -10,7 +10,7 @@
             "request": "launch",
             "program": "${workspaceFolder}/interactive.py",
             "console": "integratedTerminal",
-            "justMyCode": true,
+            "justMyCode": false,
             "args": [
                 //"C:/Users/Erik/code/sdui/outputs/20220909_143820.png"
             ]

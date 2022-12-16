@@ -28,34 +28,71 @@ import glfw
 import hashlib
 from functools import partial
 from PIL.PngImagePlugin import PngInfo, PngImageFile
-from pytorch_lightning import seed_everything
 from multiprocessing import Lock
 import json
 import zlib
 from PIL import Image
 
 # No phoning home on my watch
-os.environ['TRANSFORMERS_OFFLINE'] = '1'
-os.environ['HF_DATASETS_OFFLINE'] = '1'
-os.environ['HF_HUB_OFFLINE'] = '1' # ignored...
+#os.environ['TRANSFORMERS_OFFLINE'] = '1'
+#os.environ['HF_DATASETS_OFFLINE'] = '1'
+#os.environ['HF_HUB_OFFLINE'] = '1' # ignored...
 os.environ['DISABLE_TELEMETRY'] = '1' # ignored...
-from diffusers import StableDiffusionPipeline, DPMSolverMultistepScheduler, hub_utils, __version__ as diff_ver
+from diffusers import schedulers, StableDiffusionPipeline, hub_utils, __version__ as diff_ver
 hub_utils.HUGGINGFACE_CO_TELEMETRY = 'dummy'
 assert diff_ver == '0.10.2', 'Version changed, check logic above'
 
-from mps_patches import apply_mps_patches
+# Float16 patch
+#from torch.nn.functional import group_norm, layer_norm
+
+#def forward(self, x):
+#    return group_norm(x.float(), self.num_groups,
+#        self.weight.float(), self.bias.float(), self.eps).type(x.dtype)
+#torch.nn.functional.group_norm.forward = forward
+
+#def forward(input, shape, w, b, eps):
+#    return layer_norm(input.float(), shape, w.float(), b.float(), eps).type(input.dtype)
+#torch.nn.functional.layer_norm = forward
+
+def get_default_device_type():
+    mps = getattr(torch.backends, "mps", None)
+    if torch.cuda.is_available():
+        return "cuda"
+    elif mps and mps.is_available() and mps.is_built():
+        return "mps"
+    else:
+        return "cpu"
+
+#from mps_patches import apply_mps_patches
 #from omegaconf import OmegaConf
 #from ldm.util import instantiate_from_config
-from ldm.models.diffusion.ddim import DDIMSampler
-from ldm.models.diffusion.plms import PLMSSampler
-from ldm.models.diffusion.k_samplers import KDiffusionSampler
+#from ldm.models.diffusion.ddim import DDIMSampler
+#from ldm.models.diffusion.plms import PLMSSampler
+#from ldm.models.diffusion.k_samplers import KDiffusionSampler
 #from ldm.models.diffusion.ddpm import LatentDiffusion
-from ldm.modules.encoders.modules import get_default_device_type
+#from ldm.modules.encoders.modules import get_default_device_type
 #from ldm.modules import attention
-from pyviewer.single_image_viewer import draw as draw_debug
+#from pyviewer.single_image_viewer import draw as draw_debug
+#import diffusers.schedulers
 
-SAMPLERS_IMG2IMG = ['k_euler', 'k_euler_a', 'k_heun', 'k_lms', 'k_dpm_2', 'k_dpm_2_a']
-SAMPLERS_ALL = SAMPLERS_IMG2IMG + ['ddim', 'plms']
+SAMPLERS = [
+    'DDIM',
+    'DDPM',
+    'DPMSolverMultistep',
+    'DPMSolverSinglestep',
+    'EulerAncestral',
+    'Euler',
+    'Heun',
+    'IPNDM',
+    'KDPM2Ancestral',
+    'KDPM2',
+    'KarrasVe',
+    'PNDM',
+    'RePaint',
+    'ScoreSdeVe',
+    'ScoreSdeVp',
+    'VQDiffusion',
+]
 
 # For checking sate dump compatibility
 # Only bumped on breaking changes
@@ -68,12 +105,12 @@ import transformers
 transformers.logging.set_verbosity_error()
 
 # Float16 patch
-from ldm.modules.diffusionmodules.util import GroupNorm32
-from torch.nn.functional import group_norm
-def forward(self, x):
-    return group_norm(x.float(), self.num_groups,
-        self.weight.float(), self.bias.float(), self.eps).type(x.dtype)
-GroupNorm32.forward = forward
+#from ldm.modules.diffusionmodules.util import GroupNorm32
+#from torch.nn.functional import group_norm
+#def forward(self, x):
+#    return group_norm(x.float(), self.num_groups,
+#        self.weight.float(), self.bias.float(), self.eps).type(x.dtype)
+#GroupNorm32.forward = forward
 
 # Choose backend
 device = get_default_device_type()
@@ -196,16 +233,21 @@ def get_model(model_path, use_half):
 
     pipe = StableDiffusionPipeline.from_pretrained(
         model_path,
-        torch_dtype=torch.float32, #torch.float16 if use_half else torch.float32,
-        #local_files_only=True,
+        torch_dtype=torch.float16 if use_half else torch.float32,
+        #revision="fp16" if use_half else 'main',
     )
-    pipe.scheduler = DPMSolverMultistepScheduler.from_config(pipe.scheduler.config)
-    pipe = pipe.to(device)
 
-    prompt = "a photo of an astronaut riding a horse on mars"
-    image = pipe(prompt).images[0]
+    setattr(pipe, 'identifier', model_path)
+
+    #pipe.safety_checker = None
+
+    #pipe = pipe.to(device)
+    pipe.enable_attention_slicing()
+
+    # diffusers\pipelines\stable_diffusion\pipeline_stable_diffusion.py    
+    #image = pipe("a photo of an astronaut riding a horse on mars").images[0]
         
-    image.save("astronaut_rides_horse.png")
+    #image.save("astronaut_rides_horse.png")
 
     return pipe
 
@@ -248,33 +290,22 @@ class ModelViz(ToolbarViewer):
 
         self.post_init()
 
-    def init_sampler(self, model):
-        stype = self.state.sampler_type
-        if stype == 'plms':
-            return PLMSSampler(model)
-        elif stype == 'ddim':
-            return DDIMSampler(model)
-        elif stype == 'k_dpm_2_a':
-            return KDiffusionSampler(model, 'dpm_2_ancestral')
-        elif stype == 'k_dpm_2':
-            return KDiffusionSampler(model, 'dpm_2')
-        elif stype == 'k_euler_a':
-            return KDiffusionSampler(model, 'euler_ancestral')
-        elif stype == 'k_euler':
-            return KDiffusionSampler(model, 'euler')
-        elif stype == 'k_heun':
-            return KDiffusionSampler(model, 'heun')
-        elif stype == 'k_lms':
-            return KDiffusionSampler(model, 'lms')
-        else:
-            raise RuntimeError('Unknown sampler type')
+    def init_sampler(self, model: StableDiffusionPipeline):
+        for name in [f'{self.state.sampler_type}Scheduler',
+                     f'{self.state.sampler_type}DiscreteScheduler']:
+            scheduler = getattr(schedulers, name, None)
+            if scheduler is not None:
+                model.scheduler = scheduler.from_config(model.scheduler.config)
+                return
 
+        raise RuntimeError('Unknown sampler type')
+        
     def init_model(self, model_path) -> StableDiffusionPipeline:
-        model = get_model(model_path, self.state.fp16)
+        model = get_model(model_path, self.state.fp16).to(device)
 
         # Reset caches
         prev = self.rend.model
-        if not prev or model.ckpt != prev.ckpt:
+        if not prev or model.identifier != prev.identifier:
             self.rend.img_cache = {}
             self.rend.cond_cache = {}
 
@@ -459,8 +490,8 @@ class ModelViz(ToolbarViewer):
         # Make sure state consistent
         with (self.state_lock if need_lock else nullcontext()):
             # Not all samplers support img2img
-            if self.state.sampler_type not in SAMPLERS_IMG2IMG:
-                self.state.sampler_type = 'k_euler'
+            #if self.state.sampler_type not in SAMPLERS:
+            #    self.state.sampler_type = 'Euler'
             self.state.H = H_per_f * self.state.f
             self.state.W = W_per_f * self.state.f
             self.state.image_cond = arr_to_b64(init_latent.cpu().numpy().astype(np.float16))
@@ -509,7 +540,7 @@ class ModelViz(ToolbarViewer):
         if self.rend.last_ui_state != s:
             self.rend.last_ui_state = s
             self.rend.model = self.init_model(s.model_path)
-            self.rend.sampler = self.init_sampler(self.rend.model)
+            self.init_sampler(self.rend.model)
             self.rend.i = 0
             self.rend.intermed = torch.zeros(s.B, 3, s.H, s.W, device=device, dtype=self.dtype)
 
@@ -545,14 +576,14 @@ class ModelViz(ToolbarViewer):
         try:
             # Get conditioning
             prompt = s.prompt.replace('\n', ' ')
-            cond_key = (prompt, s.guidance_scale)
-            if cond_key not in self.rend.cond_cache:
-                uc = None if s.guidance_scale == 1.0 else model.get_learned_conditioning([""]).to(self.dtype)
-                c = model.get_learned_conditioning([prompt]).to(self.dtype)
-                self.rend.cond_cache[cond_key] = (uc, c)
-            uc, c = map(lambda v: v.repeat((s.B, 1, 1)) if v is not None else v, self.rend.cond_cache[cond_key])
+            # cond_key = (prompt, s.guidance_scale)
+            # if cond_key not in self.rend.cond_cache:
+            #     do_guidance = s.guidance_scale != 1.0
+            #     uc, c = model._encode_prompt(prompt, device, 1, do_guidance).to(self.dtype).unbind(0)  # torch.cat([uncond_embeddings, text_embeddings])
+            #     self.rend.cond_cache[cond_key] = (uc, c)
+            # uc, c = map(lambda v: v.repeat((s.B, 1, 1)) if v is not None else v, self.rend.cond_cache[cond_key])
 
-            def cbk_img(img_curr, i):
+            def cbk_img(i: int, timestep: int, latents: torch.FloatTensor): #img_curr, i):
                 self.rend.i = i + 1
                 if s != self.state or glfw.window_should_close(self.v._window):
                     raise UserAbort
@@ -560,11 +591,11 @@ class ModelViz(ToolbarViewer):
                 # Always show after last iter
                 p = self.state_soft.preview_interval
                 if self.rend.i >= s.T or (p > 0 and i % p == 0):
-                    x_samples_ddim = model.decode_first_stage(img_curr)
+                    x_samples_ddim = model.vae.decode(latents / 0.18215).sample # NCHW
                     self.rend.intermed = torch.clamp((x_samples_ddim + 1.0) / 2.0, min=0.0, max=1.0) # [1, 3, 512, 512]
                     grid = reshape_grid(self.rend.intermed) # => HWC
                     grid = grid if grid.device.type == 'cuda' else grid.cpu().numpy()
-                    self.v.upload_image(self.output_key, grid)
+                    self.v.upload_image(self.output_key, grid.float()) # float16 supported?
                     H, W, C = grid.shape
                     self.img_shape = (C, H, W)
 
@@ -590,27 +621,40 @@ class ModelViz(ToolbarViewer):
                 mask_uint8 = b64_to_arr(s.image_cond_mask, dtype=np.uint8)
                 mask = torch.tensor(mask_uint8 / 255.0, dtype=self.dtype, device=device)
             
-            seed_everything(s.seed)
+            #seed_everything(s.seed)
+            torch.manual_seed(s.seed)
+            np.random.seed(s.seed)
 
-            if isinstance(self.rend.sampler, KDiffusionSampler):
-                # txt2img, img2img or mixed, k-samplers
-                out, _ = self.rend.sampler.sample_general(
-                    steps_tot=s.T,
-                    steps_img2img=t_img2img,
-                    c=c,
-                    guidance_scale=s.guidance_scale,
-                    uc=uc,
-                    x_T=xT,
-                    x0=x0,
-                    mask=mask,
-                    img_callback=cbk_img
-                )
-                cbk_img(out, s.T - 1)
-            else:
-                # txt2img on ddim/plms
-                self.rend.sampler.sample(S=s.T, conditioning=c, batch_size=s.B,
-                    shape=shape, verbose=False, unconditional_guidance_scale=s.guidance_scale,
-                    unconditional_conditioning=uc, eta=0.0, x_T=xT, img_callback=cbk_img)
+            # txt2img, img2img or mixed
+            self.rend.model.__call__(
+                width=s.W,
+                height=s.H,
+                prompt=prompt,
+                num_inference_steps=s.T,
+                guidance_scale=s.guidance_scale,
+                num_images_per_prompt=s.B,
+                callback=cbk_img,
+            )
+
+            # if isinstance(self.rend.sampler, KDiffusionSampler):
+            #     # txt2img, img2img or mixed, k-samplers
+            #     out, _ = self.rend.sampler.sample_general(
+            #         steps_tot=s.T,
+            #         steps_img2img=t_img2img,
+            #         c=c,
+            #         guidance_scale=s.guidance_scale,
+            #         uc=uc,
+            #         x_T=xT,
+            #         x0=x0,
+            #         mask=mask,
+            #         img_callback=cbk_img
+            #     )
+            #     cbk_img(out, s.T - 1)
+            # else:
+            #     # txt2img on ddim/plms
+            #     self.rend.sampler.sample(S=s.T, conditioning=c, batch_size=s.B,
+            #         shape=shape, verbose=False, unconditional_guidance_scale=s.guidance_scale,
+            #         unconditional_conditioning=uc, eta=0.0, x_T=xT, img_callback=cbk_img)
         except UserAbort:
             # UI state changed, restart rendering
             return None
@@ -638,23 +682,13 @@ class ModelViz(ToolbarViewer):
         s.seed = max(0, imgui.input_int('Seed', s.seed, s.B, 1)[1])
         s.T = imgui.input_int('T', s.T, 1, jmp_large)[1]
         
-        #self.state_lock.acquire()
         with self.state_lock:
             chH, s.H = combo_box_vals('H', list(range(64, 2048, 64)), s.H, to_str=str)
             chW, s.W = combo_box_vals('W', list(range(64, 2048, 64)), s.W, to_str=str)
             if chH or chW:
                 self.reshape_image_cond(need_lock=False) # context manager lock released upon function call?
-        #self.state_lock.release()
-        
-        # Speed-VRAM tradeoff, larger = faster
-        # ch, self.state_soft.attn_group_size = combo_box_vals('Attn. group size', [2, 4, 8, 16], self.state_soft.attn_group_size)
-        # if imgui.is_item_hovered():
-        #     imgui.set_tooltip('Attention group size, smaller values reduce VRAM requirement at the cost of speed')
-        # if ch:
-        #     torch.cuda.empty_cache()
-        #     attention.ATTN_GROUP_SIZE = self.state_soft.attn_group_size
 
-        s.sampler_type = combo_box_vals('Sampler', SAMPLERS_ALL if s.image_cond is None else SAMPLERS_IMG2IMG, s.sampler_type)[1]
+        s.sampler_type = combo_box_vals('Sampler', SAMPLERS, s.sampler_type)[1]
         s.guidance_scale = slider_dynamic('Guidance', s.guidance_scale, 0, 20)[1]
         self.state_soft.preview_interval = imgui.slider_int('Preview interval', self.state_soft.preview_interval, 0, 10)[1]
         self.prompt_curr = imgui.input_text_multiline('Prompt', self.prompt_curr, buffer_length=2048)[1]
@@ -696,13 +730,13 @@ class UIState:
     T: int = 35
     seed: int = 0
     B: int = 1
-    H: int = 512
-    W: int = 512
+    H: int = 768
+    W: int = 768
     C: int = 4
     f: int = 8
     fp16: bool = True
     guidance_scale: float = 8.0 # classifier guidance
-    sampler_type: str = 'k_euler'
+    sampler_type: str = 'Euler'
     image_cond: str = None
     image_cond_mask: str = None
     image_cond_strength: float = 7.0 # [0, 10]
@@ -723,7 +757,6 @@ class UIStateSoft:
 class RendererState:
     last_ui_state: UIState = None # Detect changes in UI, restart rendering
     model: StableDiffusionPipeline = None
-    sampler: Union[PLMSSampler, DDIMSampler, KDiffusionSampler] = None
     intermed: torch.Tensor = None
     cond_img_handle: str = None # handle to GL texture of conditioning img
     cond_img_orig: Image = None # original conditioning image

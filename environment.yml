@@ -16,4 +16,4 @@ dependencies:
     - gdown
     - -e git+https://github.com/harskish/pyviewer.git#egg=pyviewer
 
-# conda env create --force --file environment.yaml
+# conda env create --force --file environment.yml
