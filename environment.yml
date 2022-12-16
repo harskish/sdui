@@ -6,8 +6,8 @@ dependencies:
   - pip=22.3
   - pip:
     - --extra-index-url https://download.pytorch.org/whl/cu116
-    - torch==1.13.1+cu116; platform_system != "darwin"
-    - torch==1.13.*; platform_system == "darwin"
+    - torch==1.13.1+cu116; sys_platform != "darwin"
+    - torch==1.13.*; sys_platform == "darwin"
     - ninja==1.11.*
     - transformers==4.25.*
     - accelerate==0.15.*
