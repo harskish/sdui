@@ -10,70 +10,31 @@ import torch
 import imgui
 import numpy as np
 from textwrap import dedent
-from sys import exit
 from dataclasses import dataclass
 from copy import deepcopy
 from functools import lru_cache
 from pyviewer.toolbar_viewer import ToolbarViewer
 from pyviewer.utils import reshape_grid, combo_box_vals
-from typing import Dict, Tuple, Union, List
-from os import makedirs
+from typing import Tuple
 from dataclasses import asdict
 from contextlib import nullcontext
-from base64 import b64encode, b64decode
 from pathlib import Path
 from glfw import KEY_LEFT_SHIFT
-import gdown
 import glfw
 import hashlib
 from functools import partial
+from PIL import Image
 from PIL.PngImagePlugin import PngInfo, PngImageFile
 from multiprocessing import Lock
+from pipeline import PreviewPipeline
 import json
-import zlib
-from PIL import Image
+from utils import *
 
 # No phoning home on my watch
-#os.environ['TRANSFORMERS_OFFLINE'] = '1'
-#os.environ['HF_DATASETS_OFFLINE'] = '1'
-#os.environ['HF_HUB_OFFLINE'] = '1' # ignored...
 os.environ['DISABLE_TELEMETRY'] = '1' # ignored...
 from diffusers import schedulers, StableDiffusionPipeline, hub_utils, __version__ as diff_ver
 hub_utils.HUGGINGFACE_CO_TELEMETRY = 'dummy'
 assert diff_ver == '0.10.2', 'Version changed, check logic above'
-
-# Float16 patch
-#from torch.nn.functional import group_norm, layer_norm
-
-#def forward(self, x):
-#    return group_norm(x.float(), self.num_groups,
-#        self.weight.float(), self.bias.float(), self.eps).type(x.dtype)
-#torch.nn.functional.group_norm.forward = forward
-
-#def forward(input, shape, w, b, eps):
-#    return layer_norm(input.float(), shape, w.float(), b.float(), eps).type(input.dtype)
-#torch.nn.functional.layer_norm = forward
-
-def get_default_device_type():
-    mps = getattr(torch.backends, "mps", None)
-    if torch.cuda.is_available():
-        return "cuda"
-    elif mps and mps.is_available() and mps.is_built():
-        return "mps"
-    else:
-        return "cpu"
-
-#from mps_patches import apply_mps_patches
-#from omegaconf import OmegaConf
-#from ldm.util import instantiate_from_config
-#from ldm.models.diffusion.ddim import DDIMSampler
-#from ldm.models.diffusion.plms import PLMSSampler
-#from ldm.models.diffusion.k_samplers import KDiffusionSampler
-#from ldm.models.diffusion.ddpm import LatentDiffusion
-#from ldm.modules.encoders.modules import get_default_device_type
-#from ldm.modules import attention
-#from pyviewer.single_image_viewer import draw as draw_debug
-#import diffusers.schedulers
 
 SAMPLERS = [
     'DDIM',
@@ -94,28 +55,18 @@ SAMPLERS = [
     'VQDiffusion',
 ]
 
+MODEL_URLS = parse_urls(Path('model_urls.txt'))
+
 # For checking sate dump compatibility
 # Only bumped on breaking changes
 STATE_VERSION = '2022/12/14'
-
-model_path: str = None
 
 # Suppress CLIP warning
 import transformers
 transformers.logging.set_verbosity_error()
 
-# Float16 patch
-#from ldm.modules.diffusionmodules.util import GroupNorm32
-#from torch.nn.functional import group_norm
-#def forward(self, x):
-#    return group_norm(x.float(), self.num_groups,
-#        self.weight.float(), self.bias.float(), self.eps).type(x.dtype)
-#GroupNorm32.forward = forward
-
 # Choose backend
 device = get_default_device_type()
-#if device == 'mps':
-#    apply_mps_patches()
 
 def file_drop_callback(window, paths, viewer):
     # imgui.get_mouse_pose() sometimes returns -1...
@@ -161,93 +112,33 @@ def seeds_to_samples(seeds, shape=(1, 512), dtype=torch.float32):
 
     return latents
 
-# FP16: float list ~6x larger than base64-encoded one when json-serialized
-# Header: {compressed?},{ndim},{shape0}(,{shape1},...),{data}
-def arr_to_b64(arr: np.ndarray, compress=True):
-    header = f'{"c" if compress else "u"},{arr.ndim},' + ','.join(map(str, arr.shape))
-    arr = arr.astype(np.dtype(arr.dtype).newbyteorder('<')) # convert to little-endian
-    arr_bytes = zlib.compress(arr.tobytes()) if compress else arr.tobytes()
-    b64_str = b64encode(arr_bytes).decode('ascii') # little-endian bytes to base64 str
-    return header + ',' + b64_str
-
-def b64_parse_header(s: str):
-    mode, ndim, s = s.split(',', maxsplit=2)
-    *shape, s = s.split(',', maxsplit=int(ndim))
-    shape = tuple(int(v) for v in shape)
-    return mode, shape, s
-
-def b64_to_arr(s: str, dtype: np.dtype):
-    mode, shape, s = b64_parse_header(s)
-    buffer = b64decode(s.encode('ascii'))
-    if mode == 'c':
-        buffer = zlib.decompress(buffer)
-    dtype = np.dtype(dtype).newbyteorder('<') # incoming data is little-endian
-    recovered = np.ndarray(shape=shape, dtype=dtype, buffer=buffer)
-    return recovered.astype(dtype.newbyteorder('=')) # to native byte order
-
-# Hash string into uint32
-@np.errstate(over='ignore')
-def djb2_hash(s: str):
-    hash = np.uint32(5381)
-    for c in s:
-        hash = np.uint32(33) * hash + np.uint32(ord(c))
-    return int(hash)
-
-# Imgui slider that can switch between int and float formatting at runtime
-def slider_dynamic(title, v, min, max):
-    scale_fmt = '%.2f' if np.modf(v)[0] > 0 else '%.0f' # dynamically change from ints to floats
-    return imgui.slider_float(title, v, min, max, format=scale_fmt)
-
-def download_weights():
-    id = '1slFRZAc2VMzpsX2qIsRhcyubhY6RGkyl' # folder: diffusers/1.4-fp16
-    trg = Path('models/ldm/stable-diffusion-v1/diffusers/1.4-fp16')
-    marker = trg / '.done'
-    if marker.is_file():
-        return trg
-
-    resp = None
-    while resp not in ['yes', 'y', 'no', 'n']:
-        resp = input(dedent(
-        '''
-        The model weights are licensed under the CreativeML OpenRAIL License.
-        Please read the full license here: https://huggingface.co/spaces/CompVis/stable-diffusion-license
-        Do you accept the terms? yes/no
-        '''))
-    
-    if resp in ['no', 'n']:
-        exit(-1)
-
-    makedirs(trg.parent, exist_ok=True)
-    gdown.download_folder(id=id, output=str(trg), quiet=False)
-    assert trg.is_dir(), 'DL failed!'
-    marker.touch()
-
-    return trg
-
 def get_act_shape(state):
     return (state.C, state.H // state.f, state.W // state.f)
 
 @lru_cache()
-def get_model(model_path, use_half):
-    model_path = "stabilityai/stable-diffusion-2-1"
+def get_model(model_url, use_half):
+    from diffusers.utils import DIFFUSERS_CACHE
+    from huggingface_hub.file_download import repo_folder_name
 
-    pipe = StableDiffusionPipeline.from_pretrained(
-        model_path,
+    # Don't look for newer revisions if .done marker exists
+    cache_dir = Path(DIFFUSERS_CACHE)
+    repo_name = repo_folder_name(repo_id=model_url, repo_type='model')
+    marker = cache_dir / repo_name / '.done'
+    
+    pipe, location = PreviewPipeline.from_pretrained(
+        model_url,
         torch_dtype=torch.float16 if use_half else torch.float32,
-        #revision="fp16" if use_half else 'main',
+        cache_dir=cache_dir,
+        local_files_only=marker.is_file(),
+        return_cached_folder=True,
     )
 
-    setattr(pipe, 'identifier', model_path)
+    assert location.startswith(str(marker.parent)), 'Inconsistent cache dirs'
 
-    #pipe.safety_checker = None
-
-    #pipe = pipe.to(device)
+    marker.touch() # downloaded successfully
+    setattr(pipe, 'identifier', model_url)
+    pipe.safety_checker = None
     pipe.enable_attention_slicing()
-
-    # diffusers\pipelines\stable_diffusion\pipeline_stable_diffusion.py    
-    #image = pipe("a photo of an astronaut riding a horse on mars").images[0]
-        
-    #image.save("astronaut_rides_horse.png")
 
     return pipe
 
@@ -303,11 +194,28 @@ class ModelViz(ToolbarViewer):
     def init_model(self, model_path) -> StableDiffusionPipeline:
         model = get_model(model_path, self.state.fp16).to(device)
 
-        # Reset caches
+        # Model same as before
         prev = self.rend.model
-        if not prev or model.identifier != prev.identifier:
-            self.rend.img_cache = {}
-            self.rend.cond_cache = {}
+        if prev and model.identifier == prev.identifier:
+            return model
+
+        # Model changed
+        self.rend.img_cache = {}
+        self.rend.cond_cache = {}
+        
+        # If using default res: keep it that way
+        if prev is not None:
+            res_old = prev.vae_scale_factor * prev.unet.config.sample_size
+            res_new = model.vae_scale_factor * model.unet.config.sample_size
+            
+            using_default_res = (self.state.W == self.state.H == res_old)
+            if using_default_res:
+                self.state.W = self.state.H = res_new
+
+        # Special cases
+        if model_path == 'prompthero/openjourney' and 'mdjrny-v4' not in self.state.prompt:
+            self.state.prompt += '\nmdjrny-v4 style'
+            self.prompt_curr += '\nmdjrny-v4 style'
 
         return model
 
@@ -389,7 +297,6 @@ class ModelViz(ToolbarViewer):
     def post_init(self):
         self.reshape_image_cond()
         self.prompt_curr = self.state.prompt
-        self.state.model_path = str(model_path)
 
     def export_img(self):
         grid = reshape_grid(self.rend.intermed).contiguous() # HWC
@@ -539,7 +446,7 @@ class ModelViz(ToolbarViewer):
         # Only works for fields annotated with type (e.g. sliders: list)
         if self.rend.last_ui_state != s:
             self.rend.last_ui_state = s
-            self.rend.model = self.init_model(s.model_path)
+            self.rend.model = self.init_model(s.model_url)
             self.init_sampler(self.rend.model)
             self.rend.i = 0
             self.rend.intermed = torch.zeros(s.B, 3, s.H, s.W, device=device, dtype=self.dtype)
@@ -548,7 +455,7 @@ class ModelViz(ToolbarViewer):
         if self.rend.i >= s.T:
             return None
 
-        model = self.rend.model
+        #model = self.rend.model
         
         # Compute hash of state
         state_hash = hashlib.sha1(json.dumps(asdict(s)).encode('utf-8')).hexdigest()
@@ -574,30 +481,23 @@ class ModelViz(ToolbarViewer):
             pass
 
         try:
-            # Get conditioning
-            prompt = s.prompt.replace('\n', ' ')
-            # cond_key = (prompt, s.guidance_scale)
-            # if cond_key not in self.rend.cond_cache:
-            #     do_guidance = s.guidance_scale != 1.0
-            #     uc, c = model._encode_prompt(prompt, device, 1, do_guidance).to(self.dtype).unbind(0)  # torch.cat([uncond_embeddings, text_embeddings])
-            #     self.rend.cond_cache[cond_key] = (uc, c)
-            # uc, c = map(lambda v: v.repeat((s.B, 1, 1)) if v is not None else v, self.rend.cond_cache[cond_key])
-
-            def cbk_img(i: int, timestep: int, latents: torch.FloatTensor): #img_curr, i):
+            def cbk_img(i, timestep, latents, x0):
                 self.rend.i = i + 1
                 if s != self.state or glfw.window_should_close(self.v._window):
-                    raise UserAbort
+                    raise UserAbort                
                 
-                # Always show after last iter
+                # Last iter: always show
                 p = self.state_soft.preview_interval
-                if self.rend.i >= s.T or (p > 0 and i % p == 0):
-                    x_samples_ddim = model.vae.decode(latents / 0.18215).sample # NCHW
-                    self.rend.intermed = torch.clamp((x_samples_ddim + 1.0) / 2.0, min=0.0, max=1.0) # [1, 3, 512, 512]
-                    grid = reshape_grid(self.rend.intermed) # => HWC
-                    grid = grid if grid.device.type == 'cuda' else grid.cpu().numpy()
-                    self.v.upload_image(self.output_key, grid.float()) # float16 supported?
-                    H, W, C = grid.shape
-                    self.img_shape = (C, H, W)
+                if (self.rend.i < s.T) and (p == 0 or i % p != 0):
+                    return
+                
+                x_samples_ddim = self.rend.model.vae.decode(x0 / 0.18215).sample # NCHW
+                self.rend.intermed = torch.clamp((x_samples_ddim + 1.0) / 2.0, min=0.0, max=1.0) # [1, 3, 512, 512]
+                grid = reshape_grid(self.rend.intermed) # => HWC
+                grid = grid if grid.device.type == 'cuda' else grid.cpu().numpy()
+                self.v.upload_image(self.output_key, grid.float()) # float16 supported?
+                H, W, C = grid.shape
+                self.img_shape = (C, H, W)
 
             t_img2img = 0
             x0 = xT = None
@@ -621,7 +521,6 @@ class ModelViz(ToolbarViewer):
                 mask_uint8 = b64_to_arr(s.image_cond_mask, dtype=np.uint8)
                 mask = torch.tensor(mask_uint8 / 255.0, dtype=self.dtype, device=device)
             
-            #seed_everything(s.seed)
             torch.manual_seed(s.seed)
             np.random.seed(s.seed)
 
@@ -629,32 +528,27 @@ class ModelViz(ToolbarViewer):
             self.rend.model.__call__(
                 width=s.W,
                 height=s.H,
-                prompt=prompt,
+                prompt=s.prompt.replace('\n', ' '),
+                latents=xT, # from canvas
                 num_inference_steps=s.T,
                 guidance_scale=s.guidance_scale,
                 num_images_per_prompt=s.B,
                 callback=cbk_img,
             )
 
-            # if isinstance(self.rend.sampler, KDiffusionSampler):
-            #     # txt2img, img2img or mixed, k-samplers
-            #     out, _ = self.rend.sampler.sample_general(
-            #         steps_tot=s.T,
-            #         steps_img2img=t_img2img,
-            #         c=c,
-            #         guidance_scale=s.guidance_scale,
-            #         uc=uc,
-            #         x_T=xT,
-            #         x0=x0,
-            #         mask=mask,
-            #         img_callback=cbk_img
-            #     )
-            #     cbk_img(out, s.T - 1)
-            # else:
-            #     # txt2img on ddim/plms
-            #     self.rend.sampler.sample(S=s.T, conditioning=c, batch_size=s.B,
-            #         shape=shape, verbose=False, unconditional_guidance_scale=s.guidance_scale,
-            #         unconditional_conditioning=uc, eta=0.0, x_T=xT, img_callback=cbk_img)
+            # txt2img, img2img or mixed, k-samplers
+            # out, _ = self.rend.sampler.sample_general(
+            #     steps_tot=s.T,
+            #     steps_img2img=t_img2img,
+            #     c=c,
+            #     guidance_scale=s.guidance_scale,
+            #     uc=uc,
+            #     x_T=xT,
+            #     x0=x0,
+            #     mask=mask,
+            #     img_callback=cbk_img
+            # )
+            # cbk_img(out, s.T - 1)
         except UserAbort:
             # UI state changed, restart rendering
             return None
@@ -688,6 +582,7 @@ class ModelViz(ToolbarViewer):
             if chH or chW:
                 self.reshape_image_cond(need_lock=False) # context manager lock released upon function call?
 
+        s.model_url = combo_box_vals('Model', MODEL_URLS, s.model_url)[1]
         s.sampler_type = combo_box_vals('Sampler', SAMPLERS, s.sampler_type)[1]
         s.guidance_scale = slider_dynamic('Guidance', s.guidance_scale, 0, 20)[1]
         self.state_soft.preview_interval = imgui.slider_int('Preview interval', self.state_soft.preview_interval, 0, 10)[1]
@@ -726,12 +621,12 @@ class ModelViz(ToolbarViewer):
 # Volatile state: requires recomputation of results
 @dataclass
 class UIState:
-    model_path: str = None
-    T: int = 35
+    model_url: str = MODEL_URLS[0]
+    T: int = 30
     seed: int = 0
     B: int = 1
-    H: int = 768
-    W: int = 768
+    H: int = 512
+    W: int = 512
     C: int = 4
     f: int = 8
     fp16: bool = True
@@ -756,12 +651,12 @@ class UIStateSoft:
 @dataclass
 class RendererState:
     last_ui_state: UIState = None # Detect changes in UI, restart rendering
-    model: StableDiffusionPipeline = None
+    model: PreviewPipeline = None
     intermed: torch.Tensor = None
     cond_img_handle: str = None # handle to GL texture of conditioning img
     cond_img_orig: Image = None # original conditioning image
-    img_cache: Dict[str, torch.Tensor] = None
-    cond_cache: Dict[Tuple[str, float], Tuple[torch.Tensor, torch.Tensor]] = None
+    img_cache: dict[str, torch.Tensor] = None
+    cond_cache: dict[Tuple[str, float], Tuple[torch.Tensor, torch.Tensor]] = None
     i: int = 0 # current computation progress
 
 def init_torch():
@@ -780,7 +675,6 @@ if __name__ == '__main__':
     parser.add_argument('input', type=str, nargs='?', default=None, help='Image to load state from')
     args = parser.parse_args()
     
-    model_path = download_weights() # global
     init_torch()
     viewer = ModelViz('sdui', input=args.input)
     print('Done')

@@ -1,0 +1,9 @@
+# List of Huggingface Hub model identifiers to show in UI
+# Can be Hub identifiers or local filesystem paths
+
+prompthero/openjourney              # fine-tuned 1.5. Need to append 'mdjrny-v4 style' to prompt
+# prompthero/openjourney-v2           # fine-tuned 1.5
+stabilityai/stable-diffusion-2-1
+runwayml/stable-diffusion-v1-5
+CompVis/stable-diffusion-v1-4
+wavymulder/Analog-Diffusion         # fine-tuned 1.5
