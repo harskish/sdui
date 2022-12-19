@@ -134,9 +134,10 @@ def get_model(model_url, use_half):
     )
 
     assert location.startswith(str(marker.parent)), 'Inconsistent cache dirs'
+    commit_hash = location.split('/')[-1] # specific model snapshot
 
     marker.touch() # downloaded successfully
-    setattr(pipe, 'identifier', model_url)
+    setattr(pipe, 'snapshot', commit_hash)
     pipe.safety_checker = None
     pipe.enable_attention_slicing()
 
@@ -196,7 +197,7 @@ class ModelViz(ToolbarViewer):
 
         # Model same as before
         prev = self.rend.model
-        if prev and model.identifier == prev.identifier:
+        if prev and model.snapshot == prev.snapshot:
             return model
 
         # Model changed
@@ -225,6 +226,7 @@ class ModelViz(ToolbarViewer):
             'state': asdict(self.state),
             'state_soft': asdict(self.state_soft),
             'version': STATE_VERSION,
+            'model_snapshot': self.rend.model.snapshot,
         }
 
     def load_state_from_img(self, path):
@@ -493,9 +495,9 @@ class ModelViz(ToolbarViewer):
                 
                 x_samples_ddim = self.rend.model.vae.decode(x0 / 0.18215).sample # NCHW
                 self.rend.intermed = torch.clamp((x_samples_ddim + 1.0) / 2.0, min=0.0, max=1.0) # [1, 3, 512, 512]
-                grid = reshape_grid(self.rend.intermed) # => HWC
+                grid = reshape_grid(self.rend.intermed).float() # => HWC
                 grid = grid if grid.device.type == 'cuda' else grid.cpu().numpy()
-                self.v.upload_image(self.output_key, grid.float()) # float16 supported?
+                self.v.upload_image(self.output_key, grid) # float16 supported?
                 H, W, C = grid.shape
                 self.img_shape = (C, H, W)
 
