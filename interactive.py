@@ -36,6 +36,15 @@ from diffusers import schedulers, StableDiffusionPipeline, hub_utils, __version_
 hub_utils.HUGGINGFACE_CO_TELEMETRY = 'dummy'
 assert diff_ver == '0.10.2', 'Version changed, check logic above'
 
+# Save some bandwidth
+from diffusers.configuration_utils import ConfigMixin
+def override(json_file):
+    d = json.loads(Path(json_file).read_text())
+    if 'safety_checker' in d:
+        del d['safety_checker']
+    return d
+ConfigMixin._dict_from_json_file = override
+
 SAMPLERS = [
     'DDIM',
     'DDPM',
